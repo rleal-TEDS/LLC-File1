@@ -1,0 +1,65 @@
+-- LLCfile1 table
+-----------------
+-- Used to contain selection of data for the next LLC file 1 submission
+-- including both current and historic names and addresses, etc.
+
+-- The field names and types are specified by LLC and are all char/varchar.
+-- The ultimate destination will be a csv file
+-- in which empty strings will effectively be treated as nulls
+-- so treat all columns as NOT NULL with defaults of empty strings.
+-- Also use VARCHAR(1) not CHAR(1) for GENDER_CD and all flag fields
+-- to avoid getting a space instead of an empty string
+-- (even though guidance says to use CHAR(1)).
+
+-- 'Current' details including permission flags are selected (first) in table LLCfile1twinCurrent.
+-- This table will be used as a reference for selection because it uniquely identifies every
+-- individual twin to be included in the file 1 selection.
+-- The contents of LLCfile1twinCurrent will be appended to LLCfile1
+-- then historic rows will be identified and appended, using a separate script.
+
+-- Note that the flag variables are only set in the 'current' rows (table LLCfile1twinCurrent),
+-- and can be left empty for additional 'historic' rows, hence defaults of empty strings
+-- and default of 'H' for new rows in ROW_STATUS.
+
+DROP TABLE TEDS_ADMIN.dbo.LLCfile1;
+
+CREATE TABLE TEDS_ADMIN.dbo.LLCfile1
+(
+STUDY_ID VARCHAR(50) NOT NULL,
+ROW_STATUS CHAR(1) NOT NULL DEFAULT 'H',
+NHS_NUMBER VARCHAR(10) NOT NULL DEFAULT '',
+SURNAME VARCHAR(255) NOT NULL DEFAULT '',
+FORENAME VARCHAR(255) NOT NULL DEFAULT '',
+MIDDLENAMES VARCHAR(255) NOT NULL DEFAULT '',
+ADDRESS_1 VARCHAR(255) NOT NULL DEFAULT '',
+ADDRESS_2 VARCHAR(255) NOT NULL DEFAULT '',
+ADDRESS_3 VARCHAR(255) NOT NULL DEFAULT '',
+ADDRESS_4 VARCHAR(255) NOT NULL DEFAULT '',
+ADDRESS_5 VARCHAR(255) NOT NULL DEFAULT '',
+POSTCODE VARCHAR(8) NOT NULL DEFAULT '',
+ADDRESS_START_DATE VARCHAR(10) NOT NULL DEFAULT '',
+ADDRESS_END_DATE VARCHAR(10) NOT NULL DEFAULT '',
+DATE_OF_BIRTH VARCHAR(10) NOT NULL DEFAULT '',
+GENDER_CD VARCHAR(1) NOT NULL DEFAULT '',
+CREATE_DATE VARCHAR(10) NOT NULL DEFAULT GETDATE(),
+UKLLC_STATUS VARCHAR(1) NOT NULL DEFAULT '',
+NHS_E_Linkage_Permission VARCHAR(1) NOT NULL DEFAULT '',
+NHS_Digital_Study_Number VARCHAR(50) NOT NULL DEFAULT '',
+NHS_S_Linkage_Permission VARCHAR(1) NOT NULL DEFAULT '',
+NHS_S_Study_Number VARCHAR(50) NOT NULL DEFAULT '',
+NHS_W_Linkage_Permission VARCHAR(1) NOT NULL DEFAULT '',
+NHS_NI_Linkage_Permission VARCHAR(1) NOT NULL DEFAULT '',
+NHS_NI_Study_Number VARCHAR(50) NOT NULL DEFAULT '',
+Geocoding_Permission VARCHAR(1) NOT NULL DEFAULT '',
+Small_Area_Permission VARCHAR(1) NOT NULL DEFAULT '',
+Environment_Permission VARCHAR(1) NOT NULL DEFAULT '',
+Property_Level_Permission VARCHAR(1) NOT NULL DEFAULT '',
+Multiple_Birth VARCHAR(1) NOT NULL DEFAULT '',
+National_Opt_Out VARCHAR(1) NOT NULL DEFAULT '',
+DFE_Linkage_Permission VARCHAR(1) NOT NULL DEFAULT '',
+DWP_Linkage_Permission VARCHAR(1) NOT NULL DEFAULT '',
+HMRC_Linkage_Permission VARCHAR(1) NOT NULL DEFAULT ''
+)
+
+-- Should not need keys in this table because no joins are anticipated
+-- and there are multiple rows for a given STUDY_ID.
