@@ -1,0 +1,1606 @@
+-- LLC File 1 Selection
+-----------------------
+-- Select twin data for LLC file 1.
+
+-- First populate table LLCfile1twinCurrent with details for the 'current' row for each twin.
+-- This includes the current TEDS record of name, address, dob, gender and various LLC flag variables.
+-- This table will then act as useful record of unique individual twins to be included
+-- which can aid subsequent selection of historic rows of data.
+
+-- Use view dbo.MailMergeTwins to populate LLCfile1twinCurrent, because this view selects the
+-- most appropriate address for each twin, from either dbo.Twins or dbo.ContactParent,
+-- according to the value of Twins.UseParentContactDetails
+-- hence halving the number of inserts that would otherwise be required.
+
+-- Then populate table LLCfile1, first by appending contents of LLCfile1twinCurrent for current rows.
+-- Then go through a series of stages to select and clean 'historic' data rows for each twin,
+-- containing old records of twin names, twin addresses and parent addresses (if different).
+
+-- The 'historic' rows should only include data in STUDY_ID, ROW_STATUS, CREATE_DATE, name fields (if changed),
+-- address fields (if changed) and start/end date if available; other fields set to empty strings.
+-- All dates must be strings in format dd/mm/yyyy: convert date variables using CONVERT(VARCHAR(10),[date_var],103).
+-- We do not have meaningful start dates for current rows.
+-- For historic rows, use logged date (Addresses and TwinAddresses tables) as the nearest available thing
+-- to end date, even if not reliable as an actual name/address change date.
+-- Also for historic rows, where a date is not logged, and we are confident that it's not the current address,
+-- we can substitute a default of '00/00/0000'.
+
+-- We do not need to make an explicit insert in every field, because there are default values defined.
+-- Note that some defaults differ between tables LLCfile1 and LLCfile1twinCurrent.
+-- STUDY_ID	is a unique, randomised string of letters and numbers now stored in Twins.LLC_STUDY_ID.
+-- This same STUDY_ID field must be included in all file 2 files.
+-- It will be hashed (in LLC) in the same way for file 1 and file 2, so it will match for file merges.
+-- Note that file 2 will also need to include a separate family identifier
+-- (ideally randomised) and twin order to enable twin pair identification
+-- and these will be in the "background" file 2 dataset that will be shared with all researchers.
+
+-- In the first file 1 submission, all twins will be selected for linkage and have flag values 1.
+-- In subsequent file 1 submissions, all those twins included in previous submissions must be included
+-- and must have flags changed from 1 to 0 if no longer to be selected for linkage.
+-- This would apply to twins who, since the first submission, have opted out or withdrawn,
+-- but also those who have become address problems so are now known not to have received fair processing.
+
+USE TEDS_ADMIN;
+
+-- Delete old table contents first
+----------------------------------
+DELETE TEDS_ADMIN.dbo.LLCfile1twinCurrent;
+DELETE TEDS_ADMIN.dbo.LLCfile1;
+
+-- Prepare current rows for new submission
+-- =======================================
+-- These are appended to table LLCfile1twinCurrent.
+-- Every current row has ROW_STATUS='C' (default value in this table).
+-- This is done using multiple inserts below.
+-- It would be possible to reduce the number of insert statements by combining the conditions
+-- but the separate inserts helps with clarity and also to learn numbers involved.
+-- Currently, there are six inserts:
+-- (1) New TEDS twins, without e-risk consent, not previously in file 1
+-- (2) New E-Risk consents, not previously in file 1
+-- (3) Repeat TEDS twins, previously in file 1, without e-risk consent, with fair processing status unchanged
+-- (4) Repeat E-Risk consents, status unchanged
+-- (5) Repeat TEDS twins with status changed so no longer eligible for linkage
+-- (6) Repeat E-Risk consents, no longer eligible because of opt out or withdrawal
+
+-- First insert: new twins from TEDS
+------------------------------------
+-- This included everyone for the very first file 1 submission.
+-- In each subsequent submission, it includes additional TEDS cases who were not in earlier file 1 submissions.
+-- This excludes the new E-Risk consents (inserted separately below).
+-- Select only twins who have been sent the TEDS fair processing plus reminder
+-- (by post AND by email) and who have not withdrawn or opted out
+-- and have NOT been included in file 1 before
+-- and have not given consent to E-Risk.
+-- In this insert, rely on default '1' in all permission flags and 'C' for ROW_STATUS in this table.
+-- GENDER_CD: 1=male, 2=female, 9=unknown but swap male-female value if Twins.ChangedGender = 1.
+-- This insert does include twins currently at an overseas address (but use a null for their postcodes).
+INSERT INTO dbo.LLCfile1twinCurrent
+ (TwinID, STUDY_ID, SURNAME, FORENAME, ADDRESS_1, ADDRESS_2, ADDRESS_3, ADDRESS_4, ADDRESS_5, POSTCODE,
+ DATE_OF_BIRTH, GENDER_CD, CREATE_DATE, LLCfile1alreadySent, Withdrawn, OptedOut, FairProcessingSent)
+SELECT
+t.TwinID AS TwinID,
+t.LLC_STUDY_ID AS STUDY_ID,
+t.Surname AS SURNAME,
+t.Forename AS FORENAME,
+ISNULL(t.AddressLine1, '') AS ADDRESS_1,
+ISNULL(t.AddressLine2, '') AS ADDRESS_2,
+ISNULL(t.AddressTown, '') AS ADDRESS_3,
+ISNULL(t.AddressCounty, '') AS ADDRESS_4,
+ISNULL(t.AddressCountry, '') AS ADDRESS_5,
+CASE WHEN t.Postcode IS NULL THEN '' 
+	WHEN LEN(t.Postcode) > 8 THEN '' 
+	WHEN dbo.NotEmptyText(t.AddressCountry) = 1 THEN '' 
+	WHEN dbo.CheckValidPostcodeUK(t.Postcode) = 0 THEN '' 
+	ELSE t.Postcode END AS POSTCODE,
+CONVERT(VARCHAR(10),t.TwinBirthdate,103) AS DATE_OF_BIRTH,
+CASE WHEN t.TwinSex IS NULL THEN 9 
+	WHEN (t.TwinSex = 1 AND ISNULL(t.ChangedGender, 0) = 0) THEN 1 
+	WHEN (t.TwinSex = 0 AND ISNULL(t.ChangedGender, 0) = 0) THEN 2 
+	WHEN (t.TwinSex = 1 AND t.ChangedGender = 1) THEN 2 
+	WHEN (t.TwinSex = 0 AND t.ChangedGender = 1) THEN 1 END AS GENDER_CD,
+CONVERT(VARCHAR(10),GETDATE(),103) AS CREATE_DATE,
+0 AS LLCfile1alreadySent,
+0 AS Withdrawn,
+0 AS OptedOut,
+1 AS FairProcessingSent
+FROM dbo.NHSlinkageProgress n
+INNER JOIN dbo.MailMergeTwins t ON (n.FamilyID = t.FamilyID)
+WHERE t.TwinWithdrawn = 0
+AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1ERiskNHSconsent WHEN 2 THEN n.Twin2ERiskNHSconsent END) = 0
+AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCinFile1 WHEN 2 THEN n.Twin2LLCinFile1 END) = 0
+AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1linkageOptOut WHEN 2 THEN n.Twin2linkageOptOut END) = 0
+AND ((CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCfairProcSent WHEN 2 THEN n.Twin2LLCfairProcSent END) = 1
+	AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCfairProcRem1 WHEN 2 THEN n.Twin2LLCfairProcRem1 END) = 1
+	AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCfairProcEmail WHEN 2 THEN n.Twin2LLCfairProcEmail END) = 1
+	AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCfairProcEmailRem1 WHEN 2 THEN n.Twin2LLCfairProcEmailRem1 END) = 1);
+-- Initially we wanted to include those sent fair processing + reminder by EITHER post or email
+-- but not necessarily both, but currently we require both post and email.
+-- If this decision changes, modify the condition both here and below.
+
+-- Second insert: new twins from E-Risk
+---------------------------------------
+-- This must include any twins with an E-Risk consent recorded
+-- not opted out or withdrawn
+-- not included in file 1 before.
+-- These conditions should ensure twins are not duplicated from the first insert above.
+-- NOTE: other consent fields (geocoding, DFE, DWP, HMRC) are recorded for E-Risk 
+-- so the insert must include explicit values for these flags rather than the default of 0.
+-- Also, for E-Risk consents, National_Opt_Out = 0, not the TEDS default of 1.
+INSERT INTO dbo.LLCfile1twinCurrent
+ (TwinID, STUDY_ID, SURNAME, FORENAME, ADDRESS_1, ADDRESS_2, ADDRESS_3, ADDRESS_4, ADDRESS_5, POSTCODE,
+ DATE_OF_BIRTH, GENDER_CD, CREATE_DATE, LLCfile1alreadySent, Withdrawn, OptedOut, FairProcessingSent,
+ Geocoding_Permission, Small_Area_Permission, Environment_Permission, Property_Level_Permission,
+ DFE_Linkage_Permission, DWP_Linkage_Permission, HMRC_Linkage_Permission, National_Opt_Out)
+SELECT
+t.TwinID AS TwinID,
+t.LLC_STUDY_ID AS STUDY_ID,
+t.Surname AS SURNAME,
+t.Forename AS FORENAME,
+ISNULL(t.AddressLine1, '') AS ADDRESS_1,
+ISNULL(t.AddressLine2, '') AS ADDRESS_2,
+ISNULL(t.AddressTown, '') AS ADDRESS_3,
+ISNULL(t.AddressCounty, '') AS ADDRESS_4,
+ISNULL(t.AddressCountry, '') AS ADDRESS_5,
+CASE WHEN t.Postcode IS NULL THEN '' 
+	WHEN LEN(t.Postcode) > 8 THEN '' 
+	WHEN dbo.NotEmptyText(t.AddressCountry) = 1 THEN '' 
+	WHEN dbo.CheckValidPostcodeUK(t.Postcode) = 0 THEN '' 
+	ELSE t.Postcode END AS POSTCODE,
+CONVERT(VARCHAR(10),t.TwinBirthdate,103) AS DATE_OF_BIRTH,
+CASE WHEN t.TwinSex IS NULL THEN 9 
+	WHEN (t.TwinSex = 1 AND ISNULL(t.ChangedGender, 0) = 0) THEN 1 
+	WHEN (t.TwinSex = 0 AND ISNULL(t.ChangedGender, 0) = 0) THEN 2 
+	WHEN (t.TwinSex = 1 AND t.ChangedGender = 1) THEN 2 
+	WHEN (t.TwinSex = 0 AND t.ChangedGender = 1) THEN 1 END AS GENDER_CD,
+CONVERT(VARCHAR(10),GETDATE(),103) AS CREATE_DATE,
+0 AS LLCfile1alreadySent,
+0 AS Withdrawn,
+0 AS OptedOut,
+1 AS FairProcessingSent,
+CASE WHEN t.TwinOrder = 1 AND n.Twin1ERiskGEOconsent = 1 THEN '2'
+	WHEN t.TwinOrder = 2 AND n.Twin2ERiskGEOconsent = 1 THEN '2' ELSE '0' END AS Geocoding_Permission,
+'0' AS Small_Area_Permission,
+'0' AS Environment_Permission,
+'0' AS Property_Level_Permission,
+CASE WHEN t.TwinOrder = 1 AND n.Twin1ERiskDFEconsent = 1 THEN '1'
+	WHEN t.TwinOrder = 2 AND n.Twin2ERiskDFEconsent = 1 THEN '1' ELSE '0' END AS DFE_Linkage_Permission,
+CASE WHEN t.TwinOrder = 1 AND n.Twin1ERiskDWPconsent = 1 THEN '1'
+	WHEN t.TwinOrder = 2 AND n.Twin2ERiskDWPconsent = 1 THEN '1' ELSE '0' END AS DWP_Linkage_Permission,
+CASE WHEN t.TwinOrder = 1 AND n.Twin1ERiskHMRCconsent = 1 THEN '1'
+	WHEN t.TwinOrder = 2 AND n.Twin2ERiskHMRCconsent = 1 THEN '1' ELSE '0' END AS HMRC_Linkage_Permission,
+'0' AS National_Opt_Out
+FROM dbo.NHSlinkageProgress n
+INNER JOIN dbo.MailMergeTwins t ON (n.FamilyID = t.FamilyID)
+WHERE t.TwinWithdrawn = 0
+AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCinFile1 WHEN 2 THEN n.Twin2LLCinFile1 END) = 0
+AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1ERiskNHSconsent WHEN 2 THEN n.Twin2ERiskNHSconsent END) = 1
+AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1linkageOptOut WHEN 2 THEN n.Twin2linkageOptOut END) = 0;
+
+-- Third insert: TEDS repeat twins who are still to be included in linkage
+--------------------------------------------------------------------------
+-- They must be logged with the first file 1 submission sent, not opted out, not withdrawn,
+-- and still logged with fair processing mailing and reminder sent (because the latter can be un-logged).
+-- Also, this excludes any twins with E-Risk consent (dealt with separately below).
+-- There were no such twins in the first file 1 submission but there will be some in subsequent submissions.
+-- We must select all those previously selected for file 1 (logged in NHSlinkageProgress)
+-- if the same eligibility criteria still apply and there is no ERisk consent.
+-- As they are still eligible, include their full contact details
+-- and set all NHS permission flags to 1.
+INSERT INTO dbo.LLCfile1twinCurrent
+ (TwinID, STUDY_ID, SURNAME, FORENAME, ADDRESS_1, ADDRESS_2, ADDRESS_3, ADDRESS_4, ADDRESS_5, POSTCODE, DATE_OF_BIRTH, GENDER_CD, CREATE_DATE, 
+ UKLLC_STATUS, NHS_E_Linkage_Permission, NHS_S_Linkage_Permission, NHS_W_Linkage_Permission, NHS_NI_Linkage_Permission,
+ LLCfile1alreadySent, Withdrawn, OptedOut, FairProcessingSent)
+SELECT
+t.TwinID AS TwinID,
+t.LLC_STUDY_ID AS STUDY_ID,
+t.Surname AS SURNAME,
+t.Forename AS FORENAME,
+ISNULL(t.AddressLine1, '') AS ADDRESS_1,
+ISNULL(t.AddressLine2, '') AS ADDRESS_2,
+ISNULL(t.AddressTown, '') AS ADDRESS_3,
+ISNULL(t.AddressCounty, '') AS ADDRESS_4,
+ISNULL(t.AddressCountry, '') AS ADDRESS_5,
+CASE WHEN t.Postcode IS NULL THEN '' 
+	WHEN LEN(t.Postcode) > 8 THEN '' 
+	WHEN dbo.NotEmptyText(t.AddressCountry) = 1 THEN '' 
+	WHEN dbo.CheckValidPostcodeUK(t.Postcode) = 0 THEN '' 
+	ELSE t.Postcode END AS POSTCODE,
+CONVERT(VARCHAR(10),t.TwinBirthdate,103) AS DATE_OF_BIRTH,
+CASE WHEN t.TwinSex IS NULL THEN 9 
+	WHEN (t.TwinSex = 1 AND ISNULL(t.ChangedGender, 0) = 0) THEN 1 
+	WHEN (t.TwinSex = 0 AND ISNULL(t.ChangedGender, 0) = 0) THEN 2 
+	WHEN (t.TwinSex = 1 AND t.ChangedGender = 1) THEN 2 
+	WHEN (t.TwinSex = 0 AND t.ChangedGender = 1) THEN 1 END AS GENDER_CD,
+CONVERT(VARCHAR(10),GETDATE(),103) AS CREATE_DATE,
+'1' AS UKLLC_STATUS,
+'1' AS NHS_E_Linkage_Permission,
+'1' AS NHS_S_Linkage_Permission,
+'1' AS NHS_W_Linkage_Permission,
+'1' AS NHS_NI_Linkage_Permission,
+1 AS LLCfile1alreadySent,
+0 AS Withdrawn,
+0 AS OptedOut,
+1 AS FairProcessingSent
+FROM dbo.NHSlinkageProgress n
+INNER JOIN dbo.MailMergeTwins t ON (n.FamilyID = t.FamilyID)
+WHERE  t.TwinWithdrawn = 0
+AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1ERiskNHSconsent WHEN 2 THEN n.Twin2ERiskNHSconsent END) = 0
+AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCinFile1 WHEN 2 THEN n.Twin2LLCinFile1 END) = 1
+AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1linkageOptOut WHEN 2 THEN n.Twin2linkageOptOut END) = 0
+AND ((CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCfairProcSent WHEN 2 THEN n.Twin2LLCfairProcSent END) = 1
+	AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCfairProcRem1 WHEN 2 THEN n.Twin2LLCfairProcRem1 END) = 1
+	AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCfairProcEmail WHEN 2 THEN n.Twin2LLCfairProcEmail END) = 1
+	AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCfairProcEmailRem1 WHEN 2 THEN n.Twin2LLCfairProcEmailRem1 END) = 1);
+
+-- Fourth insert: E-Risk repeat twins who are still to be included in linkage
+-----------------------------------------------------------------------------
+-- As above, logged with the first file 1 submission sent, not opted out, not withdrawn,
+-- and still logged with E-Risk NHS consent.
+-- The latter condition should ensure no duplication from the insert above.
+-- NOTE: in addition to the values inserted as above (third insert)
+-- we must insert recorded flags for geocoding, DFE, DWP, HMRC linkage consents from E-Risk.
+-- Also, for E-Risk consents, National_Opt_Out = 0, not the TEDS default of 1.
+INSERT INTO dbo.LLCfile1twinCurrent
+ (TwinID, STUDY_ID, SURNAME, FORENAME, ADDRESS_1, ADDRESS_2, ADDRESS_3, ADDRESS_4, ADDRESS_5, POSTCODE, DATE_OF_BIRTH, GENDER_CD, CREATE_DATE, 
+ UKLLC_STATUS, NHS_E_Linkage_Permission, NHS_S_Linkage_Permission, NHS_W_Linkage_Permission, NHS_NI_Linkage_Permission,
+ LLCfile1alreadySent, Withdrawn, OptedOut, FairProcessingSent,
+ Geocoding_Permission, Small_Area_Permission, Environment_Permission, Property_Level_Permission,
+ DFE_Linkage_Permission, DWP_Linkage_Permission, HMRC_Linkage_Permission, National_Opt_Out)
+SELECT
+t.TwinID AS TwinID,
+t.LLC_STUDY_ID AS STUDY_ID,
+t.Surname AS SURNAME,
+t.Forename AS FORENAME,
+ISNULL(t.AddressLine1, '') AS ADDRESS_1,
+ISNULL(t.AddressLine2, '') AS ADDRESS_2,
+ISNULL(t.AddressTown, '') AS ADDRESS_3,
+ISNULL(t.AddressCounty, '') AS ADDRESS_4,
+ISNULL(t.AddressCountry, '') AS ADDRESS_5,
+CASE WHEN t.Postcode IS NULL THEN '' 
+	WHEN LEN(t.Postcode) > 8 THEN '' 
+	WHEN dbo.NotEmptyText(t.AddressCountry) = 1 THEN '' 
+	WHEN dbo.CheckValidPostcodeUK(t.Postcode) = 0 THEN '' 
+	ELSE t.Postcode END AS POSTCODE,
+CONVERT(VARCHAR(10),t.TwinBirthdate,103) AS DATE_OF_BIRTH,
+CASE WHEN t.TwinSex IS NULL THEN 9 
+	WHEN (t.TwinSex = 1 AND ISNULL(t.ChangedGender, 0) = 0) THEN 1 
+	WHEN (t.TwinSex = 0 AND ISNULL(t.ChangedGender, 0) = 0) THEN 2 
+	WHEN (t.TwinSex = 1 AND t.ChangedGender = 1) THEN 2 
+	WHEN (t.TwinSex = 0 AND t.ChangedGender = 1) THEN 1 END AS GENDER_CD,
+CONVERT(VARCHAR(10),GETDATE(),103) AS CREATE_DATE,
+'1' AS UKLLC_STATUS,
+'1' AS NHS_E_Linkage_Permission,
+'1' AS NHS_S_Linkage_Permission,
+'1' AS NHS_W_Linkage_Permission,
+'1' AS NHS_NI_Linkage_Permission,
+1 AS LLCfile1alreadySent,
+0 AS Withdrawn,
+0 AS OptedOut,
+1 AS FairProcessingSent,
+CASE WHEN t.TwinOrder = 1 AND n.Twin1ERiskGEOconsent = 1 THEN '2'
+	WHEN t.TwinOrder = 2 AND n.Twin2ERiskGEOconsent = 1 THEN '2' ELSE '0' END AS Geocoding_Permission,
+'0' AS Small_Area_Permission,
+'0' AS Environment_Permission,
+'0' AS Property_Level_Permission,
+CASE WHEN t.TwinOrder = 1 AND n.Twin1ERiskDFEconsent = 1 THEN '1'
+	WHEN t.TwinOrder = 2 AND n.Twin2ERiskDFEconsent = 1 THEN '1' ELSE '0' END AS DFE_Linkage_Permission,
+CASE WHEN t.TwinOrder = 1 AND n.Twin1ERiskDWPconsent = 1 THEN '1'
+	WHEN t.TwinOrder = 2 AND n.Twin2ERiskDWPconsent = 1 THEN '1' ELSE '0' END AS DWP_Linkage_Permission,
+CASE WHEN t.TwinOrder = 1 AND n.Twin1ERiskHMRCconsent = 1 THEN '1'
+	WHEN t.TwinOrder = 2 AND n.Twin2ERiskHMRCconsent = 1 THEN '1' ELSE '0' END AS HMRC_Linkage_Permission,
+'0' AS National_Opt_Out
+FROM dbo.NHSlinkageProgress n
+INNER JOIN dbo.MailMergeTwins t ON (n.FamilyID = t.FamilyID)
+WHERE  t.TwinWithdrawn = 0
+AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCinFile1 WHEN 2 THEN n.Twin2LLCinFile1 END) = 1
+AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1ERiskNHSconsent WHEN 2 THEN n.Twin2ERiskNHSconsent END) = 1
+AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1linkageOptOut WHEN 2 THEN n.Twin2linkageOptOut END) = 0;
+
+-- Fifth insert: TEDS repeat twins who can no longer be included
+----------------------------------------------------------------
+-- Previously included in file 1 but no longer valid for NHS linkage.
+-- For TEDS (no E-Risk consent) this can include those who were sent fair processing
+-- but have subsequently opted out or withdrawn,
+-- or whose fair processing mailings have been unlogged because of address/email problems.
+-- For all these cases, we set all permission flags to 0 (or let default values apply)
+-- and set all contact details fields to empty strings.
+INSERT INTO dbo.LLCfile1twinCurrent
+ (TwinID, STUDY_ID, SURNAME, FORENAME, ADDRESS_1, ADDRESS_2, ADDRESS_3, ADDRESS_4, ADDRESS_5, POSTCODE, DATE_OF_BIRTH, GENDER_CD, CREATE_DATE, 
+ UKLLC_STATUS, NHS_E_Linkage_Permission, NHS_S_Linkage_Permission, NHS_W_Linkage_Permission, NHS_NI_Linkage_Permission,
+ LLCfile1alreadySent, Withdrawn, OptedOut, FairProcessingSent)
+SELECT
+t.TwinID AS TwinID,
+t.LLC_STUDY_ID AS STUDY_ID,
+'' AS SURNAME,
+'' AS FORENAME,
+'' AS ADDRESS_1,
+'' AS ADDRESS_2,
+'' AS ADDRESS_3,
+'' AS ADDRESS_4,
+'' AS ADDRESS_5,
+'' AS POSTCODE,
+'' AS DATE_OF_BIRTH,
+'' AS GENDER_CD,
+CONVERT(VARCHAR(10),GETDATE(),103) AS CREATE_DATE,
+'0' AS UKLLC_STATUS,
+'0' AS NHS_E_Linkage_Permission,
+'0' AS NHS_S_Linkage_Permission,
+'0' AS NHS_W_Linkage_Permission,
+'0' AS NHS_NI_Linkage_Permission,
+1 AS LLCfile1alreadySent,
+t.TwinWithdrawn AS Withdrawn,
+CASE t.TwinOrder WHEN 1 THEN n.Twin1linkageOptOut 
+	WHEN 2 THEN n.Twin2linkageOptOut END AS OptedOut,
+CASE WHEN t.TwinOrder = 1 AND n.Twin1LLCfairProcSent = 1 AND n.Twin1LLCfairProcRem1 = 1 AND n.Twin1LLCfairProcEmail = 1 AND n.Twin1LLCfairProcEmailRem1 = 1 THEN 1
+	WHEN t.TwinOrder = 2 AND n.Twin2LLCfairProcSent = 1 AND n.Twin2LLCfairProcRem1 = 1 AND n.Twin2LLCfairProcEmail = 1 AND n.Twin2LLCfairProcEmailRem1 = 1 THEN 1
+	ELSE 0 END AS FairProcessingSent
+FROM dbo.NHSlinkageProgress n
+INNER JOIN dbo.MailMergeTwins t ON (n.FamilyID = t.FamilyID)
+WHERE (CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCinFile1 WHEN 2 THEN n.Twin2LLCinFile1 END) = 1
+AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1ERiskNHSconsent WHEN 2 THEN n.Twin2ERiskNHSconsent END) = 0
+AND (
+		(t.TwinWithdrawn = 1)
+		OR ((CASE t.TwinOrder WHEN 1 THEN n.Twin1linkageOptOut WHEN 2 THEN n.Twin2linkageOptOut END) = 1)
+		OR ((CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCfairProcSent WHEN 2 THEN n.Twin2LLCfairProcSent END) = 0)
+		OR ((CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCfairProcRem1 WHEN 2 THEN n.Twin2LLCfairProcRem1 END) = 0)
+		OR ((CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCfairProcEmail WHEN 2 THEN n.Twin2LLCfairProcEmail END) = 0)
+		OR ((CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCfairProcEmailRem1 WHEN 2 THEN n.Twin2LLCfairProcEmailRem1 END) = 0)
+	);
+
+-- Sixth insert: E-Risk repeat twins who can no longer be included
+------------------------------------------------------------------
+-- Previously included in file 1 but no longer valid for NHS linkage.
+-- For twins with E-Risk consents, this will include those with consent still recorded but now opted out or withdrawn,
+-- ignoring any record of fair processing.
+-- (If E-Risk consent was previously logged but has now been un-logged,
+-- then the twin effectively becomes a TEDS, not E-Risk, case again
+-- and will have been inserted above).
+-- As E-Risk consent is still recorded (but opted out or withdrawn)
+-- and the twin has been asked for explicit consent in the past
+-- then log National_Opt_Out='0' instead of the default '1'.
+INSERT INTO dbo.LLCfile1twinCurrent
+ (TwinID, STUDY_ID, SURNAME, FORENAME, ADDRESS_1, ADDRESS_2, ADDRESS_3, ADDRESS_4, ADDRESS_5, POSTCODE, DATE_OF_BIRTH, GENDER_CD, CREATE_DATE, 
+ UKLLC_STATUS, NHS_E_Linkage_Permission, NHS_S_Linkage_Permission, NHS_W_Linkage_Permission, NHS_NI_Linkage_Permission,
+ LLCfile1alreadySent, Withdrawn, OptedOut, FairProcessingSent, National_Opt_Out)
+SELECT
+t.TwinID AS TwinID,
+t.LLC_STUDY_ID AS STUDY_ID,
+'' AS SURNAME,
+'' AS FORENAME,
+'' AS ADDRESS_1,
+'' AS ADDRESS_2,
+'' AS ADDRESS_3,
+'' AS ADDRESS_4,
+'' AS ADDRESS_5,
+'' AS POSTCODE,
+'' AS DATE_OF_BIRTH,
+'' AS GENDER_CD,
+CONVERT(VARCHAR(10),GETDATE(),103) AS CREATE_DATE,
+'0' AS UKLLC_STATUS,
+'0' AS NHS_E_Linkage_Permission,
+'0' AS NHS_S_Linkage_Permission,
+'0' AS NHS_W_Linkage_Permission,
+'0' AS NHS_NI_Linkage_Permission,
+1 AS LLCfile1alreadySent,
+t.TwinWithdrawn AS Withdrawn,
+CASE t.TwinOrder WHEN 1 THEN n.Twin1linkageOptOut 
+	WHEN 2 THEN n.Twin2linkageOptOut END AS OptedOut,
+CASE WHEN t.TwinOrder = 1 AND n.Twin1LLCfairProcSent = 1 AND n.Twin1LLCfairProcRem1 = 1 AND n.Twin1LLCfairProcEmail = 1 AND n.Twin1LLCfairProcEmailRem1 = 1 THEN 1
+	WHEN t.TwinOrder = 2 AND n.Twin2LLCfairProcSent = 1 AND n.Twin2LLCfairProcRem1 = 1 AND n.Twin2LLCfairProcEmail = 1 AND n.Twin2LLCfairProcEmailRem1 = 1 THEN 1
+	ELSE 0 END AS FairProcessingSent,
+'0' AS National_Opt_Out
+FROM dbo.NHSlinkageProgress n
+INNER JOIN dbo.MailMergeTwins t ON (n.FamilyID = t.FamilyID)
+WHERE (CASE t.TwinOrder WHEN 1 THEN n.Twin1LLCinFile1 WHEN 2 THEN n.Twin2LLCinFile1 END) = 1
+AND (CASE t.TwinOrder WHEN 1 THEN n.Twin1ERiskNHSconsent WHEN 2 THEN n.Twin2ERiskNHSconsent END) = 1
+AND (
+		(t.TwinWithdrawn = 1) 
+		OR ((CASE t.TwinOrder WHEN 1 THEN n.Twin1linkageOptOut WHEN 2 THEN n.Twin2linkageOptOut END) = 1)
+	);
+
+
+
+-- Copy Current rows into the LLCfile1 table
+--------------------------------------------
+-- Address start and end dates, NHS number and middle name are blank so leave these to defaults.
+-- The LLCfile1 table does not include TwinID or the few admin fields added to LLCfile1twinCurrent.
+INSERT INTO dbo.LLCfile1
+ (STUDY_ID, ROW_STATUS, SURNAME, FORENAME, ADDRESS_1, ADDRESS_2, ADDRESS_3, ADDRESS_4, ADDRESS_5, POSTCODE, 
+ DATE_OF_BIRTH, GENDER_CD, CREATE_DATE, UKLLC_STATUS, 
+ NHS_E_Linkage_Permission, NHS_Digital_Study_Number, NHS_S_Linkage_Permission, NHS_S_Study_Number, NHS_W_Linkage_Permission, NHS_NI_Linkage_Permission, NHS_NI_Study_Number, 
+ Geocoding_Permission, Small_Area_Permission, Environment_Permission, Property_Level_Permission,
+ Multiple_Birth, National_Opt_Out, DFE_Linkage_Permission, DWP_Linkage_Permission, HMRC_Linkage_Permission)
+SELECT STUDY_ID, ROW_STATUS, SURNAME, FORENAME, ADDRESS_1, ADDRESS_2, ADDRESS_3, ADDRESS_4, ADDRESS_5, POSTCODE, 
+ DATE_OF_BIRTH, GENDER_CD, CREATE_DATE, UKLLC_STATUS, 
+ NHS_E_Linkage_Permission, NHS_Digital_Study_Number, NHS_S_Linkage_Permission, NHS_S_Study_Number, NHS_W_Linkage_Permission, NHS_NI_Linkage_Permission, NHS_NI_Study_Number, 
+ Geocoding_Permission, Small_Area_Permission, Environment_Permission, Property_Level_Permission,
+ Multiple_Birth, National_Opt_Out, DFE_Linkage_Permission, DWP_Linkage_Permission, HMRC_Linkage_Permission
+FROM dbo.LLCfile1twinCurrent;
+
+-- Insert Historic rows of data
+-- ============================
+-- Make use of default 'H' value for ROW_STATUS, and default empty strings in most other fields of LLCfile1
+-- only inserting STUDY_ID and changed values of names or addresses, plus start date if it can be estimated.
+
+-- Historic rows (1): Current parent address
+-- =========================================
+-- For twins at parent addresses (Twins.[UseParentContactDetails]=1), addresses are already inserted above.
+-- For a twin living at their own address (Twins.[UseParentContactDetails]=0),
+-- the parent address will often be the first historic address, and could be an address to which the twin returns.
+-- Omit withdrawn parents (addresses deleted) and overseas addresses (Address6 is not empty)
+-- and only include twins already selected in LLCfile1twinCurrent, using inner join,
+-- if the permission flag UKLLC_STATUS=1 (we don't need historic rows for opted out twins).
+-- Also check that the parent address is different from the current address already recorded (address line 1).
+-- Place the formatted LastAddressDate into ADDRESS_END_DATE even though thoroughly unreliable as an end date,
+-- simply because it will eventually help to sequence this address after older historic address rows.
+INSERT INTO dbo.LLCfile1
+ (STUDY_ID, ADDRESS_1, ADDRESS_2, ADDRESS_3, ADDRESS_4, POSTCODE, CREATE_DATE, ADDRESS_END_DATE)
+SELECT 
+t.LLC_STUDY_ID AS STUDY_ID,
+-- CAST(((10 * dbo.ScrambleFamilyID(t.FamilyID)) + t.TwinOrder) AS VARCHAR(50)) AS STUDY_ID,
+ISNULL(p.Address1, '') AS ADDRESS_1,
+dbo.CombineAddressFields(p.Address2, p.Address3) AS ADDRESS_2,
+ISNULL(p.Address4, '') AS ADDRESS_3,
+ISNULL(p.Address5, '') AS ADDRESS_4,
+CASE WHEN p.Postcode IS NULL THEN '' WHEN LEN(p.Postcode) > 8 THEN ''
+	WHEN dbo.CheckValidPostcodeUK(p.Postcode) = 0 THEN '' ELSE p.Postcode END AS POSTCODE,
+CONVERT(VARCHAR(10), GETDATE(), 103) AS CREATE_DATE,
+CONVERT(VARCHAR(10), p.LastAddressDate, 103) AS ADDRESS_END_DATE
+FROM dbo.ContactParent p
+INNER JOIN [dbo].[Twins] t ON (p.FamilyID = t.FamilyID)
+INNER JOIN dbo.LLCfile1twinCurrent l ON (l.TwinID = t.TwinID)
+WHERE l.UKLLC_STATUS = 1
+AND t.UseParentContactDetails = 0
+AND p.ParentWithdrawn = 0
+AND dbo.NotEmptyText(p.Address6) = 0
+AND p.LastAddressDate IS NOT NULL
+AND p.Address1 <> l.ADDRESS_1;
+
+-- Historic rows (2): changed twin names
+-- =====================================
+-- From the TwinAddresses table, by splitting the names from the start of the string
+-- then comparing with the current recorded names.
+
+-- Use a temporary table (dropped later in script) for initial processing of row data from TwinAddresses table.
+-- The first four columns are direct inserts from TwinAddress, the latter columns are for cleaning.
+CREATE TABLE dbo.File1TwinNames
+(
+AddressID int NOT NULL,
+TwinID int NOT NULL,
+NameAddress VARCHAR(200) NOT NULL,
+DateOfAddress smalldatetime NULL,
+Surname VARCHAR(255) NOT NULL DEFAULT '',
+Forename VARCHAR(255) NOT NULL DEFAULT '',
+ChangedSurname bit NOT NULL DEFAULT 0,
+ChangedForename bit NOT NULL DEFAULT 0
+);
+-- Insert all available rows from TwinAddresses table
+-- for those twins whose historic data we are interested it;
+-- namely, twins already in table LLCfile1twinCurrent with UKLLC_STATUS = 1.
+INSERT INTO dbo.File1TwinNames (AddressID, TwinID, NameAddress, DateOfAddress)
+SELECT a.AddressID, a.TwinID, a.NameAddress, a.DateOfAddress
+FROM dbo.TwinAddresses a
+INNER JOIN dbo.LLCfile1twinCurrent f ON (a.TwinID = f.TwinID)
+WHERE f.UKLLC_STATUS = 1;
+
+-- Do some basic cleaning of the NameAddress string
+---------------------------------------------------
+--Get rid of blanks from left and right 
+UPDATE ADS 
+SET [NameAddress] = LTRIM(RTRIM(([NameAddress])))
+FROM dbo.File1TwinNames AS ADS;
+--Replace quadruple space 
+UPDATE ADS
+SET [NameAddress] = REPLACE([NameAddress], '    ', ' ')
+FROM dbo.File1TwinNames AS ADS;
+--Replace triple space 
+UPDATE ADS
+SET [NameAddress] = REPLACE([NameAddress], '   ', ' ')
+FROM dbo.File1TwinNames AS ADS;
+--Replace double space 
+UPDATE ADS
+SET [NameAddress] = REPLACE([NameAddress], '  ', ' ')
+FROM dbo.File1TwinNames AS ADS;
+-- Replace line breaks
+UPDATE ADS
+SET [NameAddress] = REPLACE(REPLACE([NameAddress], CHAR(13), ''), CHAR(10), '')
+FROM dbo.File1TwinNames AS ADS;
+-- repeat in case more than one
+UPDATE ADS
+SET [NameAddress] = REPLACE(REPLACE([NameAddress], CHAR(13), ''), CHAR(10), '')
+FROM dbo.File1TwinNames AS ADS;
+-- All strings should start with a forename then a surname, then there may or may not be an address,
+-- all separated by spaces; parse out the first two words as assumed forename and surname
+-- using user-defined function GetSubstring.
+UPDATE ADS
+SET Forename = dbo.GetSubstring([NameAddress], ' ', 0, 1), Surname = dbo.GetSubstring([NameAddress], ' ', 0, 2)
+FROM dbo.File1TwinNames AS ADS;
+
+-- Find changed names
+---------------------
+-- Now identify whether the forename and surname and the same as in the current record (same as in Twins table).
+UPDATE ADS
+SET ChangedForename = 1
+FROM dbo.File1TwinNames ADS
+INNER JOIN dbo.LLCfile1twinCurrent c ON (c.TwinID = ADS.TwinID)
+WHERE ADS.Forename <> c.FORENAME;
+UPDATE ADS
+SET ChangedSurname = 1
+FROM dbo.File1TwinNames ADS
+INNER JOIN dbo.LLCfile1twinCurrent c ON (c.TwinID = ADS.TwinID)
+WHERE ADS.Surname <> c.SURNAME;
+-- Delete rows in which both forename and surname are unchanged
+DELETE dbo.File1TwinNames
+WHERE ChangedForename = 0 AND ChangedSurname = 0;
+-- Clean up some oddities
+-- First, remove cases where the twin has a two-word name (with a space) in File1TwinNames
+-- which will have led to a faulty extraction from the NameAddress string.
+DELETE dbo.File1TwinNames
+WHERE ChangedForename = 1
+AND TwinID IN (SELECT TwinID FROM dbo.Twins WHERE CHARINDEX(' ', TwinFore) > 0);
+DELETE dbo.File1TwinNames
+WHERE ChangedSurname = 1
+AND TwinID IN (SELECT TwinID FROM dbo.Twins WHERE CHARINDEX(' ', TwinSur) > 0);
+-- Also delete a surprising number of oddities where twin forenames were apparently swapped accidentally,
+-- always assuming that the current forename (in Twins table) is the correct one.
+DELETE dbo.File1TwinNames
+WHERE TwinID IN (SELECT f.TwinID
+	FROM dbo.File1TwinNames f
+	INNER JOIN dbo.Twins t ON (f.TwinID = t.TwinID)
+	INNER JOIN dbo.Twins co ON (co.FamilyID = t.FamilyID)
+	WHERE co.TwinOrder <> t.TwinOrder
+	AND f.Forename = co.TwinFore);
+
+-- Now do a bit more cleaning on these names.
+-- Delete a few isolated oddities with a number (phone or postcode?) somehow in the name position.
+DELETE dbo.File1TwinNames
+WHERE Surname LIKE '[0-9]%'
+OR Forename LIKE '[0-9]%';
+
+-- Visual inspection shows a few remaining cases where the surname is recorded with a space in TwinAddresses
+-- but the space is not present in the current record.
+-- Where surname is 'MC', inspection shows names have not changed so delete.
+DELETE dbo.File1TwinNames
+WHERE Surname = 'MC';
+-- Where surname is 'EL', the surname has changed so re-extract the two-part surname from NameAddress string.
+UPDATE ADS
+SET Surname = dbo.GetSubstring([NameAddress], ' ', 0, 2) + ' ' + dbo.GetSubstring([NameAddress], ' ', 0, 3)
+FROM dbo.File1TwinNames AS ADS
+WHERE Surname = 'EL';
+-- and confirm that surname has changed in these two cases
+UPDATE ADS
+SET ChangedSurname = 1
+FROM dbo.File1TwinNames ADS
+INNER JOIN dbo.LLCfile1twinCurrent c ON (c.TwinID = ADS.TwinID)
+WHERE ADS.Surname <> c.SURNAME;
+
+-- Remove duplicate records
+---------------------------
+-- There are many duplicated names, arising from changes of addresses as well as names.
+-- Identify the duplicated names and delete them.
+-- In each case, retain the record with the most recent date
+-- as the best available estimate of the date when the twin's name was changed.
+WITH ADS
+AS( SELECT *
+    , ROW_NUMBER()OVER(PARTITION BY [Surname], [Forename] ORDER BY DateOfAddress DESC)  as RN
+	,COUNT(*) OVER(PARTITION BY [Surname], [Forename] ) AS CT
+	FROM  dbo.File1TwinNames ADS)
+DELETE
+FROM ADS
+WHERE rn > 1;
+
+-- Insert as historic rows
+--------------------------
+-- First, replace unchanged forename or surname with empty space, keeping just the named part.
+UPDATE dbo.File1TwinNames
+SET Surname = '' WHERE ChangedSurname = 0;
+UPDATE dbo.File1TwinNames
+SET Forename = '' WHERE ChangedForename = 0;
+
+-- These are now ready to insert as historic rows; the date is an estimate of the last known date
+-- when the given name was changed.
+INSERT INTO dbo.LLCfile1
+ (STUDY_ID, SURNAME, FORENAME, ADDRESS_END_DATE, CREATE_DATE)
+SELECT 
+t.LLC_STUDY_ID AS STUDY_ID,
+-- CAST(((10 * dbo.ScrambleFamilyID(t.FamilyID)) + t.TwinOrder) AS VARCHAR(50)) AS STUDY_ID,
+n.Surname AS SURNAME,
+n.Forename AS FORENAME,
+CASE WHEN n.DateOfAddress IS NULL THEN '00/00/0000' ELSE CONVERT(VARCHAR(10), n.DateOfAddress, 103) END AS ADDRESS_END_DATE,
+CONVERT(VARCHAR(10), GETDATE(), 103) AS CREATE_DATE
+FROM dbo.Twins t
+INNER JOIN dbo.File1TwinNames n ON (t.TwinID = n.TwinID);
+
+-- Table has now served its purpose so drop it.
+DROP TABLE dbo.File1TwinNames;
+
+-- Historic rows (3): changed twin addresses
+-- =========================================
+-- From the TwinAddresses table, by separating the address from the names
+-- then splitting the address into distinct fields as far as possible
+-- and making comparison with the current recorded address.
+-- These records are relatively recent and relatively clean (compared with older parent records in Addresses table, see later).
+
+-- Use a temporary table (dropped later in script) for initial processing of row data from TwinAddresses table.
+-- The first four columns are direct inserts from TwinAddress, the latter columns are for cleaning.
+CREATE TABLE dbo.File1TwinAddresses
+(
+AddressID int NOT NULL,
+TwinID int NOT NULL,
+NameAddress VARCHAR(200) NOT NULL,
+DateOfAddress smalldatetime NULL,
+CleanedAddress VARCHAR(200) NOT NULL DEFAULT '',
+HOUSE_NUMBER_OR_NAME VARCHAR(255) NOT NULL DEFAULT '',
+STREET_NAME VARCHAR(255) NOT NULL DEFAULT '',
+TOWN VARCHAR(255) NOT NULL DEFAULT '',
+COUNTY VARCHAR(255) NOT NULL DEFAULT '',
+POSTCODE VARCHAR(255) NOT NULL DEFAULT '',
+UpdateFlag bit NOT NULL DEFAULT 0
+);
+-- Initial steps are the same as for twin names, above.
+-- Insert all available rows from TwinAddresses table
+-- for those twins whose historic data we are interested in;
+-- namely, twins already in table LLCfile1twinCurrent with UKLLC_STATUS = 1.
+INSERT INTO dbo.File1TwinAddresses (AddressID, TwinID, NameAddress, DateOfAddress)
+SELECT a.AddressID, a.TwinID, a.NameAddress, a.DateOfAddress
+FROM dbo.TwinAddresses a
+INNER JOIN dbo.LLCfile1twinCurrent f ON (a.TwinID = f.TwinID)
+WHERE f.UKLLC_STATUS = 1;
+
+-- Do some basic cleaning of the NameAddress string
+---------------------------------------------------
+--Get rid of blanks from left and right 
+UPDATE ADS 
+SET [NameAddress] = LTRIM(RTRIM(([NameAddress])))
+FROM dbo.File1TwinAddresses AS ADS;
+--Replace quadruple space 
+UPDATE ADS
+SET [NameAddress] = REPLACE([NameAddress], '    ', ' ')
+FROM dbo.File1TwinAddresses AS ADS;
+--Replace triple space 
+UPDATE ADS
+SET [NameAddress] = REPLACE([NameAddress], '   ', ' ')
+FROM dbo.File1TwinAddresses AS ADS;
+--Replace double space 
+UPDATE ADS
+SET [NameAddress] = REPLACE([NameAddress], '  ', ' ')
+FROM dbo.File1TwinAddresses AS ADS;
+-- Replace line breaks
+UPDATE ADS
+SET [NameAddress] = REPLACE(REPLACE([NameAddress], CHAR(13), ''), CHAR(10), '')
+FROM dbo.File1TwinAddresses AS ADS;
+-- repeat in case more than one
+UPDATE ADS
+SET [NameAddress] = REPLACE(REPLACE([NameAddress], CHAR(13), ''), CHAR(10), '')
+FROM dbo.File1TwinAddresses AS ADS;
+
+-- Some records just contain a forename and surname (2 words or 3 words) with no address
+-- and these must be deleted.
+-- There are also some worthless or badly formed names+addresses with 4, 5 or 6 words.
+-- (always without postcodes) which can be deleted; the condition is that there are fewer than 6 spaces (7 words).
+DELETE dbo.File1TwinAddresses
+WHERE dbo.GetSeparatorPosition([NameAddress], ' ', 0, 6) = 0;
+-- name-address with 7 words are sometimes OK but will be cleaned below (especially for postcode)
+
+-- Separate the postcode and the rest of the address
+----------------------------------------------------
+-- This assumes that a postcode appears at the end of the string and comprises two substrings separated by a space.
+-- User-defined function GetSubstring: 3rd parameter value 1 searches from the end not the beginning.
+UPDATE ADS
+SET [POSTCODE] = dbo.GetSubstring([NameAddress], ' ', 1, 2) + ' ' +  dbo.GetSubstring([NameAddress], ' ', 1, 1)
+FROM dbo.File1TwinAddresses AS ADS;
+-- Immediately delete records with invalid UK postcodes.
+-- These may include records without any postcode at all (where last two words are town/county names)
+-- and overseas records where the last word will be the country.
+DELETE dbo.File1TwinAddresses
+WHERE dbo.CheckValidPostcodeUK(POSTCODE) = 0;
+
+-- Separate the remaining address string
+----------------------------------------
+-- Attempt to remove the twin name (start of string) and postcode (end of string)
+-- placing the remainder in the CleanedAddress field.
+-- Here, we have to assume that both name and postcode consist of two substrings separated by spaces.
+UPDATE ADS
+SET CleanedAddress = LTRIM(RTRIM(SUBSTRING([NameAddress], 1 + dbo.GetSeparatorPosition([NameAddress], ' ', 0, 2),
+	LEN([NameAddress]) - dbo.GetSeparatorPosition([NameAddress], ' ', 1, 2) - dbo.GetSeparatorPosition([NameAddress], ' ', 0, 2) )))
+FROM dbo.File1TwinAddresses AS ADS;
+
+-- Remove duplicated address records.
+-- These seem to occur where the same address has been recorded with two different names.
+-- Sometimes, the cotwin's address was recorded by mistake then corrected.
+-- In each case, retain the record with the most recent date
+-- as the best available estimate of the date when the twin's old address was changed.
+WITH ADS
+AS( SELECT *
+    , ROW_NUMBER() OVER(PARTITION BY CleanedAddress ORDER BY DateOfAddress DESC) as RN
+	, COUNT(*) OVER(PARTITION BY CleanedAddress ) AS CT
+	FROM dbo.File1TwinAddresses ADS)
+DELETE
+FROM ADS
+WHERE rn > 1;
+
+-- Remove one or two 'care of' addresses
+DELETE dbo.File1TwinAddresses
+WHERE CleanedAddress LIKE '%c/o%'
+OR CleanedAddress LIKE '%care of%';
+
+-- Identify and separate county
+-------------------------------
+-- The county name, if given, should now be at the end of [CleanedAddress]
+-- Identify, and copy into the [COUNTY] field, setting the UpdateFlag value when done.
+-- (have to cater for mis-spellings, identified by inspection)
+-- (a) four word county
+UPDATE ADS
+SET UpdateFlag = 1,
+ [COUNTY] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 4) - 1)
+FROM dbo.File1TwinAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 4) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 4) - 1) IN ('East Riding of Yorkshire');
+-- (b) three word counties
+UPDATE ADS
+SET UpdateFlag = 1,
+ [COUNTY] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) - 1)
+FROM dbo.File1TwinAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) - 1) IN ('Argyle and Bute', 'Isle of Man', 
+'Isle Of Wight', 'Isloe of Wight', 'Isle of White',
+'Vale of Glamorgan', 'Tyne And Wear', 'Tyne and Weir', 'Neath Port Talbot', 'North East Lincolnshire',  'N. E. Lincs.',  'N E Lincs.',
+'Argyll and Bute', 'Dumfries and Galloway', 'Rhondda Cynon Taff', 'Redcar and Cleveland', 'Avon and Somerset');
+-- (c) two word counties
+UPDATE ADS
+SET UpdateFlag = 1,
+ [COUNTY] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) - 1)
+FROM dbo.File1TwinAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) - 1) IN (
+'E Sussex', 'East Sussex', 'E. Sussex', 'East Lothian', 'East Midlands', 'East Yorkshire', 'E Yorkshire', 'East Yorks',
+'N Humberside', 'North Humberside', 'N Yorkshire', 'N Yorks', 'N. Yorks', 'North Yorkshire', 'North Ayrshire', 'North Devon', 
+'North Lincolnshire', 'NE Lincolnshire', 'N.E. Lincolnshire', 'N.E. Lincs', 'North Lincs', 'N. Lincs', 'North Somerset', 'N Somerset', 'North Tyneside',
+'S Humberside', 'South Humberside', 'S Yorkshire', 'South Yorkshire', 'S Yorks', 'S. Yorks', 'South Yorks', 'South Glamorgan', 'S Glam', 'South Tyneside', 'South Gloucestershire',
+'W Midlands', 'West Midlands', 'West Sussex', 'W Sussex', 'W. Sussex', 
+'West Yorkshire', 'W Yorkshire', 'W. Yorkshire', 'West Yorks', 'W Yorks', 'West Yorkshie', 'West Yrokshire',
+'West Glamorgan', 'West Lothian', 'West Dumbartonshire',
+'Co Antrim', 'County Antrim', 'County Armagh', 'Co Armagh', 'Co Down', 'Co Durham', 'Co. Durham', 'County Durham', 
+'County Fermanagh', 'Co Fermanagh', 'Co. Fermanagh',
+'Channel Islands', 'Mid Glamorgan', 'Mid Glam', 'M Glam', 'Ross Shire', 'Greater Manchester', 'Greater Mancehster', 'Blaenau Gwent');
+-- (d) one word counties
+UPDATE ADS
+SET UpdateFlag = 1,
+ [COUNTY] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) - 1)
+FROM dbo.File1TwinAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) - 1) IN ('Aberdeenshire', 'Anglesey', 'Angus', 'Avon', 'Ayrshire', 'Antrim',
+ 'Ballymena', 'Bedfordshire', 'Beds', 'Berks', 'Berkshire', 'Berkshire,', 'Berwickshire', 'Buckinghamshire', 'Bucks',  'Bucks.', 
+	'Caithness', 'Cambridgeshire', 'Cambs', 'Carmarthenshire', 'Carms', 'Ceredigion', 'Cheshire', 'Clackmannanshire', 'Cleveland', 'Clwyd', 'Clywd', 'Conwy', 
+	'Cornwall', 'Cornwall.', 'Cumbria', 'Cumberland', 'Cwmbran', 'Deeside', 'Deeside,', 'Denbighshire', 'Derbyshire', 'Derby.', 'Derbs', 'Devon', 'Devon.', 'Dorset', 'Dumfriesshire', 'Dyfed', 
+	'Essex', 'Essec', 'Fife', 'Flintshire', 
+	'Glamorgan', 'Glos', 'Glos.', 'Gloucestershire', 'Gloucestershire.', 'Gower', 'Guernsey', 'Gwent', 'Gwynedd', 
+	'Hampshire', 'Hants', 'Hants.', 'Herefordshire', 'Hertfordshire', 'Hertfordshire.', 'Herts', 'Highland', 'Highlands', 'Humberside', 'Inverness-shire', 'Jersey',
+	'Kent', 'Kincardineshire', 'Lanarkshire', 'Lanark', 'Lancashire', 'Lancashire.', 'Lancs', 'Leicestershire', 'Leics', 'Leics.', 'Lincolnshire', 'Lincs', 'Lincs.', 'Merseyside', 
+	'Middlesex', 'Middx', 'Midlothian', 'Monmothshire', 'Monmouthshire', 'Moray', 'Morayshire', 'Neath', 'Norfolk', 'Norflok',
+	'Northamptonshire', 'Northamptonshire.', 'Northants', 
+	'Northumberland', 'Nottinghamshire', 'Nottinghamshire.', 'Notts', 'Notts.', 'Oxfordshire', 'Oxfordshire.', 'Oxon', 'Pembrokeshire', 'Pembs', 'Perthshire', 'Powys', 'RCT', 'Renfrewshire', 
+	'Roxburghshire', 'Rutland', 'Shropshire', 'Somerset', 'Somerset.', 'Staffordshire', 'Staffs', 'Stirlingshire', 'Suffolk', 'Surrey', 'Surrey,', 'Sussex', 'Sussex.', 'Sutherland',
+	'Torfaen', 'Tyne-and-Wear', 'Warwickshire', 'Warks', 'Wilts', 'Wiltshire', 'Wilitshire', 'Worcestershire', 'Worcs', 'Worcs.', 'Worc', 'Wrekin', 'Yorkshire');
+-- inspection shows that, generally, the rest don't have a county recorded, just a town.
+
+-- We can now trim the county off the end of CleanedAddress (where UpdateFlag shows county identified)
+UPDATE ADS
+SET CleanedAddress = LTRIM(RTRIM(LEFT(CleanedAddress,LEN(CleanedAddress)-LEN([COUNTY]))))
+FROM dbo.File1TwinAddresses AS ADS
+WHERE UpdateFlag = 1;
+-- and reset the flag to 0 for the next steps
+UPDATE ADS
+SET UpdateFlag = 0
+FROM dbo.File1TwinAddresses AS ADS;
+
+-- Identify and separate town or city
+-------------------------------------
+-- Now that county is removed, town or city should be at the end of the CleanedAddress string.
+-- In nearly all cases, the town/city should be recorded in upper case letters
+-- allowing identification using a trick with SQL's BINARY_CHECKSUM function
+-- (a) four word towns
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 4) - 1)
+FROM dbo.File1TwinAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 4) > 0
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)))
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 2)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 2)))
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 3)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 3)))
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 4)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 4)));
+-- (b) three word towns
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) - 1)
+FROM dbo.File1TwinAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) > 0
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)))
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 2)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 2)))
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 3)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 3)));
+-- (c) two word towns
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) - 1)
+FROM dbo.File1TwinAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) > 0
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)))
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 2)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 2)));
+-- (d) one word towns
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) - 1)
+FROM dbo.File1TwinAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) > 0
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)));
+
+-- Very few remain, where either there is no town or the town has lower case letters.
+-- By inspection, save those with identifiable towns or villages:
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) - 1)
+FROM dbo.File1TwinAddresses AS ADS
+WHERE UpdateFlag = 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) - 1) IN ('Wrexham', 'Cimla');
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) - 1)
+FROM dbo.File1TwinAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) - 1) = 'Wickham Bishops';
+
+-- The rest have no town: delete.
+DELETE dbo.File1TwinAddresses
+WHERE UpdateFlag = 0;
+
+-- CHECK NONE ARE LEFT
+--SELECT *
+--FROM dbo.File1TwinAddresses
+--WHERE UpdateFlag = 0
+
+-- We can now trim the town off the end of CleanedAddress (where UpdateFlag shows town identified)
+-- and reset the flag
+UPDATE ADS
+SET UpdateFlag = 0,
+	CleanedAddress = LTRIM(RTRIM(LEFT(CleanedAddress,LEN(CleanedAddress)-LEN([TOWN]))))
+FROM dbo.File1TwinAddresses AS ADS
+WHERE UpdateFlag = 1;
+
+-- Inspection shows that over half the remaining cleaned addresses
+-- consist only of the house name/number and the street name.
+-- Others also then have a village or district name
+-- and some others are longer with several parts, sometimes a flat number or building name,
+-- two-word villages, or other complex structures.
+-- Difficult or impossible to separate these using a script, so leave them alone
+-- and hope that the linkage software can deal with them.
+
+-- Remove historic addresses that are same as current address
+-------------------------------------------------------------
+-- These can often result from minor corrections, where we can assume the current row is correct.
+-- Assume unchanged, therefore unwanted, if first part of CleanedAddress matches Address1
+-- Identify using flag
+UPDATE a
+SET a.UpdateFlag = 1
+FROM dbo.File1TwinAddresses a
+INNER JOIN dbo.LLCfile1twinCurrent c ON (a.TwinID = c.TwinID)
+WHERE c.ADDRESS_1 = LEFT(a.CleanedAddress, LEN(c.ADDRESS_1));
+-- and delete
+DELETE dbo.File1TwinAddresses
+WHERE UpdateFlag = 1;
+-- Also assume unchanged if the postcode is the same
+-- Identify using flag
+UPDATE a
+SET a.UpdateFlag = 1
+FROM dbo.File1TwinAddresses a
+INNER JOIN dbo.LLCfile1twinCurrent c ON (a.TwinID = c.TwinID)
+WHERE a.POSTCODE = c.POSTCODE;
+-- and delete
+DELETE dbo.File1TwinAddresses
+WHERE UpdateFlag = 1;
+
+-- Insert as historic rows
+--------------------------
+-- Assume that what is left in File1TwinAddresses is clean enough to insert as historic rows in LLCfile1.
+-- What's left of CleanedAddress is inserted into address line 1,
+-- town into address line 3, county into address line 4, and postcode.
+-- The date is an estimate of the last known date when the given address was changed.
+INSERT INTO dbo.LLCfile1
+ (STUDY_ID, ADDRESS_1, ADDRESS_3, ADDRESS_4, POSTCODE, ADDRESS_END_DATE, CREATE_DATE)
+SELECT 
+t.LLC_STUDY_ID AS STUDY_ID,
+a.CleanedAddress AS ADDRESS_1,
+a.TOWN AS ADDRESS_3,
+a.COUNTY AS ADDRESS_4,
+a.POSTCODE AS POSTCODE,
+CASE WHEN a.DateOfAddress IS NULL THEN '00/00/0000' ELSE CONVERT(VARCHAR(10), a.DateOfAddress, 103) END AS ADDRESS_END_DATE,
+CONVERT(VARCHAR(10), GETDATE(), 103) AS CREATE_DATE
+FROM dbo.Twins t
+INNER JOIN dbo.File1TwinAddresses a ON (t.TwinID = a.TwinID);
+
+-- Table has now served its purpose so drop it.
+DROP TABLE dbo.File1TwinAddresses;
+
+-- Historic rows (4): old parent addresses
+-- =======================================
+-- From the Addresses table.
+-- Process in similar ways to old twin addresses above.
+-- Some rows of this Addresses table are very old and unclean, for example with Null DateOfAddress
+-- or changes in use of capital letters for different fields, and with many other anomalies.
+-- The number of rows of data is very large and some assumptions must be made when cleaning.
+-- Each address is linked to FamilyID so could potentially be added for either or both twins
+-- (to be dealt with in a later step).
+
+-- Use a temporary table (dropped later in script) for initial processing of row data from Addresses table.
+-- The first four columns are direct inserts from Addresses, the latter columns are for cleaning.
+CREATE TABLE dbo.File1ParentAddresses
+(
+AddressID int NOT NULL,
+FamilyID int NOT NULL,
+NameAddress VARCHAR(200) NOT NULL,
+DateOfAddress smalldatetime NULL,
+CleanedAddress VARCHAR(200) NOT NULL DEFAULT '',
+HOUSE_NUMBER_OR_NAME VARCHAR(255) NOT NULL DEFAULT '',
+STREET_NAME VARCHAR(255) NOT NULL DEFAULT '',
+TOWN VARCHAR(255) NOT NULL DEFAULT '',
+COUNTY VARCHAR(255) NOT NULL DEFAULT '',
+POSTCODE VARCHAR(255) NOT NULL DEFAULT '',
+UpdateFlag bit NOT NULL DEFAULT 0
+);
+-- Start by inserting all available rows from the Addresses table
+-- for those twins whose historic data we are interested it;
+-- namely, twins already in table LLCfile1twinCurrent with UKLLC_STATUS = 1.
+-- The Addresses table is per-family, so include rows if either or both twins have been selected.
+INSERT INTO dbo.File1ParentAddresses (AddressID, FamilyID, NameAddress, DateOfAddress)
+SELECT a.AddressID, a.FamilyID, a.[Address], a.DateOfAddress
+FROM dbo.Addresses a
+WHERE a.FamilyID IN (SELECT t.FamilyID
+	FROM dbo.Twins t INNER JOIN dbo.LLCfile1twinCurrent c ON (t.TwinID = c.TwinID)
+	WHERE c.UKLLC_STATUS = 1);
+
+-- Do some basic cleaning of the NameAddress string
+---------------------------------------------------
+-- Some of the older addresses contain full stops as separators - replace each with a space.
+UPDATE ADS 
+SET [NameAddress] = REPLACE([NameAddress], '.', ' ')
+FROM dbo.File1ParentAddresses AS ADS
+WHERE [NameAddress] LIKE '%.%';
+-- Do the same with commas, which would be useful if they appeared systematically, but in fact they are rare.
+UPDATE ADS 
+SET [NameAddress] = REPLACE([NameAddress], ',', ' ')
+FROM dbo.File1ParentAddresses AS ADS
+WHERE [NameAddress] LIKE '%,%';
+--Get rid of blanks from left and right 
+UPDATE ADS 
+SET [NameAddress] = LTRIM(RTRIM(([NameAddress])))
+FROM dbo.File1ParentAddresses AS ADS;
+--Replace quadruple space 
+UPDATE ADS
+SET [NameAddress] = REPLACE([NameAddress], '    ', ' ')
+FROM dbo.File1ParentAddresses AS ADS;
+--Replace triple space 
+UPDATE ADS
+SET [NameAddress] = REPLACE([NameAddress], '   ', ' ')
+FROM dbo.File1ParentAddresses AS ADS;
+--Replace double space 
+UPDATE ADS
+SET [NameAddress] = REPLACE([NameAddress], '  ', ' ')
+FROM dbo.File1ParentAddresses AS ADS;
+-- Replace line breaks
+UPDATE ADS
+SET [NameAddress] = REPLACE(REPLACE([NameAddress], CHAR(13), ''), CHAR(10), '')
+FROM dbo.File1ParentAddresses AS ADS;
+-- repeat in case more than one
+UPDATE ADS
+SET [NameAddress] = REPLACE(REPLACE([NameAddress], CHAR(13), ''), CHAR(10), '')
+FROM dbo.File1ParentAddresses AS ADS;
+
+-- Separate the postcode and the rest of the address
+----------------------------------------------------
+-- This assumes that a postcode appears at the end of the string and comprises two substrings separated by a space.
+-- User-defined function GetSubstring: 3rd parameter value 1 searches from the end not the beginning.
+UPDATE ADS
+SET [POSTCODE] = dbo.GetSubstring([NameAddress], ' ', 1, 2) + ' ' +  dbo.GetSubstring([NameAddress], ' ', 1, 1)
+FROM dbo.File1ParentAddresses AS ADS;
+-- Immediately delete records with invalid UK postcodes.
+-- These may include records without any postcode at all (where last two words are town/county names)
+-- and overseas records where the last word will be the country.
+DELETE dbo.File1ParentAddresses
+WHERE dbo.CheckValidPostcodeUK(POSTCODE) = 0;
+-- Also delete a very few oddities with apparently valid postcode format but length exceeds 8 characters.
+DELETE dbo.File1ParentAddresses
+WHERE LEN(POSTCODE) > 8;
+
+-- Separate address string from name and postcode
+-------------------------------------------------
+-- Remove parent name from start of string, and postcode from end, copying remainder into CleanedAddress field.
+-- Do this in several stages, hence use UpdateFlag to keep track of those done.
+-- (A) Between dates 24 Feb 2002 and 4 Nov 2002, and on 2 Jan 2003,
+--	the address string does NOT include a name at the start - so just take the postcode off the end.
+-- (B) Deal with a few oddities where the name is given like 'x and y smith'
+-- (C) For the rest, assume the name is two words at the start of the string.
+
+-- (A) Between dates 24 Feb 2002 and 4 Nov 2002, and on 2 Jan 2003,
+-- there is no parent name so start at character 1 of the address string, just removing the postcode at the end
+UPDATE ADS
+SET UpdateFlag = 1,
+	CleanedAddress = SUBSTRING(NameAddress, 1, LEN(NameAddress) - dbo.GetSeparatorPosition(NameAddress, ' ', 1, 2))
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND (([DateOfAddress] BETWEEN '2002-04-23' AND '2002-11-05')
+	OR [DateOfAddress] = '2003-01-02');
+-- (B) Now deal with some oddities where the name is recorded like 'x and y smith'
+UPDATE ADS
+SET UpdateFlag = 1,
+	CleanedAddress = SUBSTRING(NameAddress, 1 + dbo.GetSeparatorPosition(NameAddress, ' ', 0, 4),
+	LEN(NameAddress) - dbo.GetSeparatorPosition(NameAddress, ' ', 1, 2) - dbo.GetSeparatorPosition(NameAddress, ' ', 0, 4) )
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSubstring(NameAddress, ' ', 0, 2) = 'AND';
+-- (C) ... the rest, assumed having 2-word names (anything not updated so far)
+UPDATE ADS
+SET UpdateFlag = 1,
+	CleanedAddress = SUBSTRING(NameAddress, 1 + dbo.GetSeparatorPosition(NameAddress, ' ', 0, 2),
+	LEN(NameAddress) - dbo.GetSeparatorPosition(NameAddress, ' ', 1, 2) - dbo.GetSeparatorPosition(NameAddress, ' ', 0, 2) )
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0;
+-- Reset the flag
+UPDATE dbo.File1ParentAddresses
+SET UpdateFlag = 0;
+
+-- Remove duplicated address records.
+-- These may have occurred for a variety of admin reasons.
+-- In each case, retain the record with the most recent date
+-- (or in case dates are null, with the higher AddressID)
+-- as the best available estimate of the date when the old address was changed.
+WITH ADS
+AS( SELECT *
+    , ROW_NUMBER() OVER(PARTITION BY CleanedAddress ORDER BY DateOfAddress DESC, AddressID DESC) as RN
+	, COUNT(*) OVER(PARTITION BY CleanedAddress ) AS CT
+	FROM dbo.File1ParentAddresses ADS)
+DELETE
+FROM ADS
+WHERE rn > 1;
+
+-- Remove some 'care of' addresses
+DELETE dbo.File1ParentAddresses
+WHERE CleanedAddress LIKE '%c/o%'
+OR CleanedAddress LIKE '%care of%';
+
+-- Now remove addresses that match the current parent address (ContactParent table)
+-- because this current address has already been recorded above, either as the current row
+-- or as the first historic row for each included twin.
+-- First delete if the first part of CleanedAddress matches ContactParent.Address1
+-- Identify using flag
+UPDATE a
+SET a.UpdateFlag = 1
+FROM dbo.File1ParentAddresses a
+INNER JOIN dbo.ContactParent c ON (a.FamilyID = c.FamilyID)
+WHERE c.Address1 = LEFT(a.CleanedAddress, LEN(c.Address1));
+-- and delete
+DELETE dbo.File1ParentAddresses
+WHERE UpdateFlag = 1;
+-- Also assume unchanged if the postcode is the same
+-- (differences in address line 1 most likely to recording errors, now corrected)
+-- Identify using flag
+UPDATE a
+SET a.UpdateFlag = 1
+FROM dbo.File1ParentAddresses a
+INNER JOIN dbo.ContactParent c ON (a.FamilyID = c.FamilyID)
+WHERE a.POSTCODE = c.Postcode;
+-- and delete
+DELETE dbo.File1ParentAddresses
+WHERE UpdateFlag = 1;
+
+-- Some very old addresses have the postcode recorded twice.
+-- If another recognisable postcode remains at the end of the string, trim it off.
+UPDATE dbo.File1ParentAddresses
+SET CleanedAddress = RTRIM(LEFT(CleanedAddress, LEN(CleanedAddress) - dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2)))
+WHERE dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) > 0
+and dbo.CheckValidPostcodeUK(RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) - 1)) = 1;
+
+-- There are old address strings ending in numbers like 'Liverpool 14' or 'W4'.
+-- Most (not all) can be corrected by removing the last substring after the last space.
+UPDATE ADS
+SET CleanedAddress = RTRIM(SUBSTRING(CleanedAddress, 1, LEN(CleanedAddress) - dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1)))
+FROM dbo.File1ParentAddresses AS ADS
+WHERE CleanedAddress LIKE '%[0-9]';
+
+-- There are a few addresses that are clearly overseas even though a valid UK postcode has already been separated.
+-- Identify these by country name at the end of the string, and delete
+DELETE dbo.File1ParentAddresses
+WHERE CleanedAddress LIKE '%canada%'
+OR CleanedAddress LIKE '%new zealand%'
+OR CleanedAddress LIKE '%japan%'
+OR CleanedAddress LIKE '%yuan%';
+
+-- Some other addresses end in UK country names or other odd fragments: remove these.
+-- First two-word fragments
+UPDATE ADS
+SET CleanedAddress = RTRIM(SUBSTRING(CleanedAddress, 1, LEN(CleanedAddress) - dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2)))
+FROM dbo.File1ParentAddresses AS ADS
+WHERE CleanedAddress like '%south wales'
+OR CleanedAddress like '%north wales'
+OR CleanedAddress like '% s e';
+-- Then one-word fragments
+UPDATE ADS
+SET CleanedAddress = RTRIM(SUBSTRING(CleanedAddress, 1, LEN(CleanedAddress) - dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1)))
+FROM dbo.File1ParentAddresses AS ADS
+WHERE CleanedAddress like '%wales'
+OR CleanedAddress like '%scotland'
+OR CleanedAddress like '% n'
+OR CleanedAddress like '% sw'
+OR CleanedAddress like '% 2840';
+-- This still leaves a few oddities that may be either cleaned or deleted or simply left alone later
+
+-- Identify and separate county
+-------------------------------
+-- The county name, if given, should now be at the end of [CleanedAddress]
+-- Identify, and copy into the [COUNTY] field, setting the UpdateFlag value when done.
+-- (have to cater for mis-spellings, identified by inspection)
+-- (a) four word county
+UPDATE ADS
+SET UpdateFlag = 1,
+ [COUNTY] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 4) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 4) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 4) - 1) IN ('East Riding of Yorkshire');
+-- (b) three word counties
+UPDATE ADS
+SET UpdateFlag = 1,
+ [COUNTY] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) - 1) IN ('Argyle and Bute', 'Isle of Man', 'Isle of Arran',
+'Isle Of Wight', 'Isloe of Wight', 'Isle of White',
+'Vale of Glamorgan', 'v of glamorgan', 'Tyne And Wear', 'Tyne and Weir', 'Tyne & Wear', 'Neath Port Talbot', 
+'North East Lincolnshire',  'N. E. Lincs.',  'N E Lincs.', 'North East Lincs',
+'Argyll and Bute', 'Dumfries and Galloway', 'Dumfries & Galloway', 'Rhondda Cynon Taff', 'R C T', 'Redcar and Cleveland', 'Avon and Somerset');
+-- (c) two word counties
+UPDATE ADS
+SET UpdateFlag = 1,
+ [COUNTY] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) - 1) IN (
+'E Sussex', 'East Sussex', 'E. Sussex', 'East Lothian', 'East Midlands', 'East Riding', 'East Yorkshire', 'E Yorkshire', 'East Yorks',
+'North Hants', 'N Humberside', 'North Humberside', 'N Yorkshire', 'N Yorks', 'N. Yorks', 'North Yorkshire', 'North Ayrshire', 'North Devon', 'N Devon',
+'North Lincolnshire', 'NE Lincolnshire', 'N.E. Lincolnshire', 'N.E. Lincs', 'N E Lincolnshire', 'North Lincs', 'N. Lincs', 'N Lincolnshire',
+'North Somerset', 'N Somerset', 'North Tyneside', 'North Yorks', 'North Wales', 'North Lanarkshire', 'North Warwickshire',
+'S Devon', 'South Devon', 'S Humberside', 'South Humberside', 'S Yorkshire', 'South Yorkshire', 'S Yorks', 'S. Yorks', 'South Yorks', 'South Glamorgan', 'S Glam', 'South Tyneside', 
+'South Gloucestershire', 'South Gloucester', 'South Wales',
+'W Midlands', 'West Midlands', 'West Mids', 'West Sussex', 'W Sussex', 'W. Sussex', 'West Susses',
+'West Yorkshire', 'W Yorkshire', 'W. Yorkshire', 'West Yorks', 'W Yorks', 'West Yorkshie', 'West Yrokshire', 'West Yorkkshire',
+'West Glamorgan', 'West Lothian', 'West Dumbartonshire',
+'Co Antrim', 'County Antrim', 'County Armagh', 'Co Armagh', 'Co Down', 'Co Durham', 'Co. Durham', 'County Durham', 
+'County Fermanagh', 'Co Fermanagh', 'Co. Fermanagh',
+'Channel Islands', 'Mid Glamorgan', 'Mid Glamrogan', 'Mid Glam', 'M Glam', 'Ross Shire', 'Greater Manchester', 'Greater Mancehster', 'Blaenau Gwent');
+-- (d) one word counties
+UPDATE ADS
+SET UpdateFlag = 1,
+ [COUNTY] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) - 1) IN ('Aberdeenshire', 'Anglesey', 'Anglesea', 'Angus', 'Argyll', 'Avon', 'Ayrshire', 'Antrim',
+ 'Ballymena', 'Bedfordshire', 'Beds', 'Berks', 'Berkshire', 'Berkshire,', 'Berwickshire', 'Buckinghamshire', 'Bucks',  'Bucks.', 
+	'Caithness', 'Cambridgeshire', 'Cambs', 'Carmarthenshire', 'Carms', 'Ceredigion', 'Cheshire', 'Clackmannanshire', 'Cleveland', 'Clwyd', 'Clywd', 'Conwy', 
+	'Cornwall', 'Cornwall.', 'Cumbria', 'Cumberland', 'Cwmbran', 'Deeside', 'Deeside,', 'Denbighshire', 'Derbyshire', 'Derby.', 'Derbs', 'Derbys', 'Devon', 'Devon.', 'Dorset', 'Dumfriesshire', 'Dyfed', 
+	'Essex', 'Essec', 'Fife', 'Flintshire', 'Flinshire',
+	'Glamorgan', 'Glos', 'Glos.', 'Gloucestershire', 'Gloustershire', 'Gower', 'Guernsey', 'Gwent', 'Gwynedd', 
+	'Hampshire', 'Hants', 'Hants.', 'Hamps', 'Herefordshire', 'Hertfordshire', 'Hertfordshire.', 'Herts', 'Highland', 'Highlands', 'Humberside', 'Inverness-shire', 'Jersey',
+	'Kent', 'Kincardineshire', 'Kirkcudbrightshire', 'Lanarkshire', 'Lanark', 'Lancashire', 'Lancashie', 'Lancs', 
+	'Leicestershire', 'Leics', 'Leics.', 'Lincolnshire', 'Lincs', 'Lincs.', 'Lincolns', 'Merseyside', 'Mid-Glamorgan',
+	'Middlesex', 'Middx', 'Midlothian', 'Monmothshire', 'Monmouthshire', 'Moray', 'Morayshire', 'Neath', 'Norfolk', 'Norflok',
+	'Northamptonshire', 'Northamptonshire.', 'Northants', 
+	'Northumberland', 'Nottinghamshire', 'Notts', 'Notts.', 'Oxfordshire', 'Oxfordshire.', 'Oxon', 'Orkney',
+	'Pembrokeshire', 'Pembrokshire', 'Pembs', 'Perthshire', 'Powys', 'RCT', 'Renfrewshire', 
+	'Roxburghshire', 'Rutland', 'Shropshire', 'Somerset', 'Somerset.', 'Staffordshire', 'Staffs', 'Stafordshire', 'Stirlingshire', 
+	'Suffolk', 'Surrey', 'Surrey,', 'Sussex', 'Sutherland', 'Tameside',
+	'Torfaen', 'Tyne-and-Wear', 'Usk', 'Warwickshire', 'Warks', 'Wigtownshire', 'Wilts', 'Wiltshire', 'Wilitshire', 
+	'Worcestershire', 'Worcestshire', 'Worcs', 'Worcs.', 'Worc', 'Wrekin', 'Yorkshire');
+-- Inspection shows that this has worked well: almost all remaining strings end with town not county name.
+-- plus some oddities that are difficult to deal with.
+-- Now where county identified (UpdateFlag=1), strip county from the end of CleanedAddress and reset flag
+UPDATE ADS
+SET CleanedAddress = LTRIM(RTRIM(LEFT(CleanedAddress,LEN(CleanedAddress)-LEN([COUNTY]))))
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 1;
+-- and reset the flag to 0 for the next steps
+UPDATE ADS
+SET UpdateFlag = 0
+FROM dbo.File1ParentAddresses AS ADS;
+
+-- Identify and separate town (1): capitalised strings
+------------------------------------------------------
+-- Many old records (missing DateOfAddress) and a small number of recent records
+-- are recorded entirely in capital letters; these cause problems with the majority of 
+-- recent records where the town can be recognised because it alone appears in capitals.
+-- So deal with these oddities as far as possible by extracting common towns by name from the end of the string.
+-- Use queries first to identify occurring town names; include those that appear more than once.
+-- Three word towns
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND BINARY_CHECKSUM(CleanedAddress) = BINARY_CHECKSUM(UPPER(CleanedAddress))
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) - 1) IN
+ ('NEWCASTLE UPON TYNE', 'CHESTER LE STREET', 'NEWCASTLE UNDER LYME', 'NEWPORT SOUTH WALES', 'WELWYN GARDEN CITY');
+-- Two word towns
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND BINARY_CHECKSUM(CleanedAddress) = BINARY_CHECKSUM(UPPER(CleanedAddress))
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) - 1) IN
+ ('ST ALBANS', 'TUNBRIDGE WELLS', 'SUTTON COLDFIELD', 'MILTON KEYNES', 'HEMEL HEMPSTEAD', 'CANVEY ISLAND',
+ 'BRIERLEY HILL', 'HAMPTON HILL', 'KINGS LYNN', 'THORNTON HEATH', 'SOUTH HARROW', 'WEST MOLESLEY',
+ 'WORCESTER PARK', 'WALTHAM CROSS', 'WEST BROMWICH', 'WEST CROYDON', 'WEST MIDLANDS');
+-- One word towns
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND BINARY_CHECKSUM(CleanedAddress) = BINARY_CHECKSUM(UPPER(CleanedAddress))
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) - 1) IN
+ ('ADDLESTONE', 'ASHFORD', 'BARNSLEY', 'BATH', 'BECKENHAM', 'BEDFORD', 'BICESTER', 'BIRMINGHAM', 'BLACKBURN', 'BOLTON', 
+ 'BOREHAMWOOD', 'BOURNEMOUTH', 'BRADFORD', 'BRAINTREE', 'BRENTWOOD', 'BRIDGEND', 'BRIDGWATER', 'BRIGHOUSE', 'BRISTOL', 
+ 'BROMLEY', 'BURY', 'CAMBRIDGE', 'CANTERBURY', 'CARDIFF', 'CARLISLE', 'CHARLTON', 'CHATHAM', 'CHELMSFORD', 'CHESHUNT', 
+ 'CHESTER', 'CHESTERFIELD', 'CHICHESTER', 'COLCHESTER', 'COLNE', 'COVENTRY', 'CREWE', 'CROYDON', 'DAGENHAM', 'DERBY', 
+ 'DONCASTER', 'DORCHESTER', 'DORKING', 'DUDLEY', 'DURHAM', 'EALING', 'EDGWARE', 'ENFIELD', 'EXETER', 'Faversham', 
+ 'GLOUCESTER', 'GRANTHAM', 'GUILDFORD', 'HALEWOOD', 'HALIFAX', 'HARLOW', 'HARPENDEN', 'HARROGATE', 'HARROW', 'Hayes', 
+ 'HEREFORD', 'HESTON', 'HITCHIN', 'HOVE', 'HUDDERSFIELD', 'HULL', 'Huntingdon', 'HUTHWAITE', 'ILFORD', 'ILFRACOMBE', 
+ 'IPSWICH', 'KINGSBRIDGE', 'LEEDS', 'LEICESTER', 'LEIGH', 'LINCOLN', 'LIVERPOOL', 'LONDON', 'LUDLOW', 'LUTON', 'LYNN', 
+ 'MAIDENHEAD', 'MANCHESTER', 'MIDDLESBROUGH', 'MITCHAM', 'MOLESEY', 'MORECAMBE', 'Newcastle-upon-Tyne', 'NEWPORT', 
+ 'NORTHALLERTON', 'NORTHAMPTON', 'NORWICH', 'NOTTINGHAM', 'OLDHAM', 'ORPINGTON', 'OXFORD', 'PETERBOROUGH', 'PINNER', 
+ 'PLYMOUTH', 'PONTEFRACT', 'PORTSMOUTH', 'PRESTON', 'PURLEY', 'READING', 'REDDITCH', 'REIGATE', 'ROCHESTER', 'ROMFORD', 
+ 'ROSSENDALE', 'ROSS-ON-WYE', 'ROTHERHAM', 'RUNCORN', 'SALFORD', 'SALISBURY', 'SANDBACH', 'SCARBOROUGH', 'SELBY', 
+ 'SHAFTESBURY', 'SHEFFIELD', 'SLOUGH', 'SMETHWICK', 'SOLIHULL', 'SOUTHALL', 'SOUTHAMPTON', 'SOUTHPORT', 'STANMORE', 
+ 'STOCKPORT', 'STOKE-ON-TRENT', 'STREET', 'SUTTON', 'SWANSEA', 'SWINDON', 'TARLETON', 'TAUNTON', 'TELFORD', 'THAXTED', 
+ 'TOTNES', 'TRURO', 'TWICKENHAM', 'UXBRIDGE', 'WAKEFIELD', 'WALLASEY', 'WALLSEND', 'WALSALL', 'WALTHAMSTOW', 'WARLEY', 
+ 'WELLINGBOROUGH', 'WELLS', 'WIGAN', 'WILMSLOW', 'WIRRAL', 'WISBECH', 'WOLVERHAMPTON', 'WORCESTER', 'WORTHING', 'YORK');
+-- This leaves 200+ fully capitalised strings with towns not extracted; mostly without dates.
+-- In these cases, rather than deleting, set UpdateFlag to 1 so the remainder of CleanedAddress will be placed
+-- into ADDRESS_1 with the TOWN field empty.
+UPDATE ADS
+SET UpdateFlag = 1
+FROM dbo.File1ParentAddresses AS ADS
+WHERE BINARY_CHECKSUM(CleanedAddress) = BINARY_CHECKSUM(UPPER(CleanedAddress))
+AND UpdateFlag = 0;
+
+-- Identify and separate town (2): recent records
+-------------------------------------------------
+-- In almost all very recent records, and in most since Nov 2001, the town name appears in capital letters
+-- at the end of CleanedAddress: use this feature to separate it into the TOWN field, setting UpdateFlag.
+-- (a) four word towns
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 4) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND ([DateOfAddress] > '2001-11-05')
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 4) > 0
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)))
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 2)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 2)))
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 3)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 3)))
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 4)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 4)));
+-- (b) three word towns
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND ([DateOfAddress] > '2001-11-05')
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) > 0
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)))
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 2)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 2)))
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 3)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 3)));
+-- (c) two word towns
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND ([DateOfAddress] > '2001-11-05')
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) > 0
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)))
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 2)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 2)));
+-- This has identified a very few oddities where a second postcode was at the end of the string: delete
+DELETE dbo.File1ParentAddresses
+WHERE dbo.CheckValidPostcodeUK(TOWN) = 1;
+-- (d) one word towns
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND ([DateOfAddress] > '2001-11-05')
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) > 0
+AND BINARY_CHECKSUM(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)) = BINARY_CHECKSUM(Upper(dbo.GetSubstring(CleanedAddress, ' ', 1, 1)));
+
+-- Identify and separate town (3): remainder
+--------------------------------------------
+-- The remainder are old records, most without DateOfAddress plus some others with dates
+-- in which CleanedAddress is generally all in lower case letters.
+-- We can only do as above, looking for recognisable town names at the end of the string.
+-- There are two many distinct town names to list them all, so query first to identify town names appearing more than once.
+-- (a) Four word towns.
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 4) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 4) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 4) - 1) IN
+ ('ST LEONARDS ON SEA')
+-- (b) Three word towns.
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 3) - 1) IN
+ ('BURNHAM ON SEA', 'BURTON UPON TRENT', 'BURY ST EDMUNDS', 'CHALFONT ST PETER', 'GRIMSBY N E', 
+ 'KIRKBY IN ASHFIELD', 'LEIGH ON SEA', 'NEWCASTLE UPON TYNE', 'NR MARKET DRAYTON', 'SOUTHEND ON SEA', 
+ 'STOCKTON ON TEES', 'STOKE ON TRENT', 'STOURPORT ON SEVERN', 'SUTTON IN ASHFIELD', 'WELWYN GARDEN CITY', 
+ 'WESTCLIFF ON SEA', 'WESTON SUPER MARE');
+-- (C) Two word towns
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) - 1) IN
+('BEXLEY HEATH', 'BISHOP AUCKLAND', 'BISHOPS STORTFORD', 'BISHOP''S STORTFORD', 'BOGNOR REGIS', 'BRIERLEY HILL', 
+'BUCKHURST HILL', 'BURGESS HILL', 'CANVEY ISLAND', 'CLEATOR MOOR', 'CUSTOM HOUSE', 'DROITWICH SPA', 
+'EAST GRINSTEAD', 'EAST SHEEN', 'GREAT BRICKHILL', 'GREAT MISSENDEN', 'GREAT YARMOUTH', 'GT YARMOUTH', 
+'HATCH BRENTWOOD', 'HAYLING ISLAND', 'HAYWARDS HEATH', 'HEBDEN BRIDGE', 'HEMEL HEMPSTEAD', 'HERNE BAY', 
+'HIGH WYCOMBE', 'HOLMER GREEN', 'KINGS LANGLEY', 'KINGS LYNN', 'KING''S LYNN', 'LEAMINGTON SPA', 
+'LEIGHTON BUZZARD', 'LEYTON BUZZARD', 'LONDON N', 'LOWER FELTHAM', 'MARKET HARBOROUGH', 'MELTON MOWBRAY', 
+'MERTHYR TYDFIL', 'MILTON KEYNES', 'MUCH WENLOCK', 'NEW ADDINGTON', 'NEW MALDEN', 'NEWTON ABBOT', 
+'NEWTON ABBOTT', 'NEWTON AYCLIFFE', 'NORTH SHIELDS', 'NR BIGGAR', 'NR CREWE', 'NR FAREHAM', 'NR HITCHIN', 
+'OLD COULSDON', 'SAFFRON WALDEN', 'SOUTH CROYDON', 'SOUTH MOLTON', 'SOUTH PERIVALE', 'SOUTH SHIELDS', 
+'SOUTH TOLWORTH', 'SOUTH WIRRAL', 'ST ALBANS', 'ST ASAPH', 'ST ATHAN', 'ST AUSTELL', 'ST HELENS', 'ST IVES', 
+'ST LEONARDS-ON-SEA', 'ST MARY', 'SUTTON COLDFIELD', 'THORNTON CLEVELEYS', 'THORNTON HEATH', 'THORPE BAY', 
+'TUNBRIDGE WELLS', 'WEST BROMWICH', 'WEST DRAYTON', 'WHITLEY BAY', 'WOODFORD GREEN', 'WOOLMER GREEN');
+-- Also where second-last word is 'near' or nr'
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 2) > 0
+AND dbo.GetSubstring(CleanedAddress, ' ', 1, 2) in ('near', 'nr');
+-- (d) One word town
+UPDATE ADS
+SET UpdateFlag = 1,
+ [TOWN] = RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) - 1)
+FROM dbo.File1ParentAddresses AS ADS
+WHERE UpdateFlag = 0
+AND dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) > 0
+AND RIGHT(CleanedAddress, dbo.GetSeparatorPosition(CleanedAddress, ' ', 1, 1) - 1) IN
+('ABBEY', 'ABERDARE', 'ABERGAVENNY', 'ACCRINGTON', 'ALCESTER', 'ALDERSHOT', 'ALFRETON', 'ALTON', 'AMERSHAM', 'AMMANFORD', 'ANDOVER', 
+'ASCOT', 'ASHBY-DE-LA-ZOUCH', 'ASHFORD', 'ASHINGTON', 'ASHTON-UNDER-LYNE', 'AYLESBURY', 'AYLESFORD', 'BANBURY', 'BANSTEAD', 
+'BARNEHURST', 'BARNET', 'BARNOLDSWICK', 'BARNSLEY', 'BARNSTAPLE', 'BARROW-IN-FURNESS', 'BARRY', 'BASILDON', 'BASINGSTOKE', 
+'BASSINGHAM', 'BATH', 'BATLEY', 'BATTERSEA', 'BATTLE', 'BECCLES', 'BECKENHAM', 'BEDFORD', 'BELPER', 'BEMBRIDGE', 'BENFLEET', 
+'BENSON', 'BERKHAMSTED', 'BEVERLEY', 'BEXLEYHEATH', 'BICESTER', 'BIGGLESWADE', 'BILLERICAY', 'BILLINGHAM', 'BILSTON', 'BINGLEY', 
+'BIRKENHEAD', 'BIRMINGHAM', 'BLACKBURN', 'BLACKPOOL', 'BLACKWOOD', 'BODMIN', 'BOLTON', 'BOOTLE', 'BORDON', 'BOREHAMWOOD', 'BOSTON', 
+'BOURNE', 'BOURNEMOUTH', 'BRACKLEY', 'BRACKNELL', 'BRADFORD', 'BRAINTREE', 'BRENTWOOD', 'BRIDGEND', 'BRIDGEWATER', 'BRIDGWATER', 
+'BRIDPORT', 'BRIGHOUSE', 'BRIGHTON', 'BRISTOL', 'BRIXHAM', 'BROADSTAIRS', 'BROMLEY', 'BROMSGROVE', 'BUCKLEY', 'BUDE', 'BUNTINGFORD', 
+'BURES', 'BURNHAM', 'BURNLEY', 'BURY', 'BUSHEY', 'BUXTON', 'CAERNARFON', 'CAERPHILLY', 'CAMBERLEY', 'CAMBRIDGE', 'CAMDEN', 'CANNOCK', 
+'CANTERBURY', 'CARDIFF', 'CARLISLE', 'CARMARTHEN', 'CARTERTON', 'CASTLEFORD', 'CATERHAM', 'CATFORD', 'CHARD', 'CHATHAM', 'CHATTERIS', 
+'CHELMSFORD', 'CHELTENHAM', 'CHEPSTOW', 'CHERTSEY', 'CHESHAM', 'CHESTER', 'CHESTERFIELD', 'CHESTER-LE-STREET', 'CHICHESTER', 
+'CHIDDINGFOLD', 'CHINGFORD', 'CHIPPENHAM', 'CHISLEHURST', 'CHISWICK', 'CHORLEY', 'CHORLEYWOOD', 'CHRISTCHURCH', 'CIRENCESTER', 
+'CLECKHEATON', 'CLEETHORPES', 'CLINTON', 'CLITHEROE', 'COALVILLE', 'COBHAM', 'COCKERMOUTH', 'COLCHESTER', 'COLEFORD', 'COLINDALE', 
+'COLLIERY', 'COLNE', 'CORBY', 'COSBY', 'COTTINGHAM', 'COVENTRY', 'COWES', 'COWPLAIN', 'CRAMLINGTON', 'CRANLEIGH', 'CRAWLEY', 
+'CRAYFORD', 'CREDITON', 'CREWE', 'CREWKERNE', 'CROMER', 'CROSBY', 'CROYDON', 'DAGENHAM', 'DARLINGTON', 'DARTFORD', 'DARWEN', 
+'DAVENTRY', 'DEAL', 'DEPTFORD', 'DERBY', 'DEREHAM', 'DESBOROUGH', 'DEVIZES', 'DEWSBURY', 'DIDCOT', 'DISS', 'DONACSTER', 
+'DONCASTER', 'DORKING', 'DOVER', 'DROITWICH', 'DRONFIELD', 'DUDLEY', 'DUNSTABLE', 'DURHAM', 'EALING', 'EASTBOURNE', 'EASTLEIGH', 
+'EDINBURGH', 'EDGWARE', 'EDMONTON', 'ELY', 'ENFIELD', 'EPSOM', 'ERITH', 'EVESHAM', 'EWELL', 'EXETER', 'EXMOUTH', 'FAREHAM', 'FARNBOROUGH', 
+'FARNCOMBE', 'FARNHAM', 'FAVERSHAM', 'FELBRIDGE', 'FELIXSTOWE', 'FELTHAM', 'FERNDOWN', 'FINCHLEY', 'FINEDON', 'FLEET', 'FOLKESTONE', 
+'FORDINGBRIDGE', 'FORRES', 'FRESHWATER', 'FRIMLEY', 'FROME', 'GAINSBOROUGH', 'GARRISON', 'GATESHEAD', 'GILLINGHAM', 'GLASGOW', 
+'GLOSSOP', 'GLOUCESTER', 'GODALMING', 'GOOLE', 'GOSPORT', 'GRANTHAM', 'GRAVESEND', 'GREENFORD', 'GRIMSBY', 'GUILDFORD', 
+'GUISBOROUGH', 'HALESOWEN', 'HALIFAX', 'HALSTEAD', 'HAMPTON', 'HANWORTH', 'HARLOW', 'HARPENDEN', 'HARROGATE', 'HARROW', 
+'HARTLEPOOL', 'HAVANT', 'HAVERFORDWEST', 'HAVERHILL', 'HAWORTH', 'HAYES', 'HEDNESFORD', 'HELSBY', 'HEMLINGTON', 
+'HENLEY-ON-THAMES', 'HEREFORD', 'HERSHAM', 'HERTFORD', 'HEXHAM', 'HIGHCLIFFE', 'HILLAM', 'HINCKLEY', 'HINDHEAD', 'HITCHIN', 
+'HODDESDON', 'HOOK', 'HORLEY', 'HORNCASTLE', 'HORNCHURCH', 'HORSHAM', 'HOUGHTON-LE-SPRING', 'HOVE', 'HUDDERSFIELD', 'HULL', 
+'HUNTINGDON', 'HURSTPIERPOINT', 'HYDE', 'ILFORD', 'ILFRACOMBE', 'ILKESTON', 'ILKLEY', 'INGATESTONE', 'IPSWICH', 'ISLEWORTH', 
+'IVYBRIDGE', 'KEIGHLEY', 'KENDAL', 'KENILWORTH', 'KENTON', 'KETTERING', 'KIDDERMINSTER', 'KILGETTY', 'KINETON', 'KINGSTON', 
+'KINGTON', 'KNUTSFORD', 'LANCASTER', 'LANCING', 'LEAMINGTON', 'LEEDS', 'LEICESTER', 'LEIGH', 'LEIGH-ON-SEA', 'LETCHWORTH', 
+'LEWES', 'LICHFIELD', 'LIFTON', 'LINCOLN', 'LIPHOOK', 'LITTLEBOROUGH', 'LITTLEHAMPTON', 'LIVERPOOL', 'LIVERSEDGE', 'LLANDOVERY', 
+'LLANDYSUL', 'LLANELLI', 'LLANGOLLEN', 'LLANIDLOES', 'LONDON', 'LOUGHBOROUGH', 'LOUGHTON', 'LOUTH', 'LOWESTOFT', 'LUTON', 
+'LYDNEY', 'LYMINGTON', 'LYNEHAM', 'MABLETHORPE', 'MACCLESFIELD', 'MACDUFF', 'MAIDENHEAD', 'MAIDSTONE', 'MALDON', 'MALTON', 
+'MANCHESTER', 'MANSFIELD', 'MARGATE', 'MATLOCK', 'MELKSHAM', 'MEXBOROUGH', 'MIDDLESBROUGH', 'MIDDLEWICH', 'MILTON', 'MINEHEAD', 
+'MIRFIELD', 'MITCHAM', 'MOFFAT', 'MOLD', 'MONMOUTH', 'MORDEN', 'MORECAMBE', 'NANTWICH', 'NEATH', 'NELSON', 'NETHERTON', 'NEWARK', 
+'NEWBURY', 'NEWCASTLE', 'NEWCASTLE-UNDER-LYME', 'NEWCASTLE-UPON-TYNE', 'NEWHAVEN', 'NEWPORT', 'NORMANTON', 'NORTHALLERTON', 
+'NORTHAMPTON', 'NORTHOLT', 'NORTHWICH', 'NORTHWOOD', 'NORWICH', 'NORWOOD', 'NOTTINGHAM', 'NOTTINGHAMSHIRE', 'NUNEATON', 'OLDHAM', 
+'OLNEY', 'ORMSKIRK', 'ORPINGTON', 'OSSETT', 'OSWESTRY', 'OTLEY', 'OXFORD', 'OXHEY', 'PEACEHAVEN', 'PENRITH', 'PENRYN', 'PENZANCE', 
+'PETERBOROUGH', 'PETERSFIELD', 'PEWSEY', 'PICKERING', 'PINNER', 'PLYMOUTH', 'PONTEFRACT', 'PONTYPOOL', 'PONTYPRIDD', 'POOLE', 
+'PORTLAND', 'PORTSLADE', 'PORTSMOUTH', 'PRESTON', 'PRUDHOE', 'PURLEY', 'PURTON', 'RADLETT', 'RAINHAM', 'RAMSGATE', 'RAYLEIGH', 
+'READING', 'REDCAR', 'REDDITCH', 'REDHILL', 'REIGATE', 'RETFORD', 'RHYL', 'RICHMOND', 'RICKMANSWORTH', 'RINGWOOD', 'RIPLEY', 
+'RISCA', 'ROBERTSBRIDGE', 'ROCHDALE', 'ROCHESTER', 'ROMFORD', 'ROMSEY', 'ROSS-ON-WYE', 'ROTHERHAM', 'RUGBY', 'RUGELEY', 
+'RUISLIP', 'RUNCORN', 'RUSHDEN', 'RYDE', 'SALE', 'SALFORD', 'SALISBURY', 'SALTASH', 'SANDBACH', 'SANDOWN', 'SANDWICH', 
+'SCARBOROUGH', 'SCOTLAND', 'SCUNTHORPE', 'SEAFORD', 'SEAHAM', 'SEATON', 'SELBY', 'SEVENOAKS', 'SHAFTESBURY', 'SHEFFIELD', 
+'SHEFFORD', 'SHEPPERTON', 'SHERINGHAM', 'SHIPLEY', 'SHIPSTON-ON-STOUR', 'SHIRLAND', 'SHOEBURYNESS', 'SHREWSBURY', 'SITTINGBOURNE', 
+'SKEGNESS', 'SKELMERSDALE', 'SKIPTON', 'SLEAFORD', 'SLOUGH', 'SOLIHULL', 'SOUTHALL', 'SOUTHAMPTON', 'SOUTHEND-ON-SEA', 'SOUTHPORT', 
+'SOUTHSEA', 'SPALDING', 'SPENNYMOOR', 'STAFFORD', 'STAINES', 'STANMORE', 'STEVENAGE', 'STOCKPORT', 'STOCKTON', 'STOCKTON-ON-TEES', 
+'STOCKWELL', 'STOKENCHURCH', 'STOKE-ON-TRENT', 'STOKESLEY', 'STORRINGTON', 'STOURBRIDGE', 'STOWMARKET', 'STRATFORD', 
+'STRATFORD-ON-AVON', 'STROUD', 'SUDBURY', 'SUNDERLAND', 'SURBITON', 'SUTTON', 'SWADLINCOTE', 'SWANSEA', 'SWINDON', 'TADCASTER', 
+'TAMWORTH', 'TAUNTON', 'TEIGNMOUTH', 'TELFORD', 'TENTERDEN', 'THETFORD', 'TIDWORTH', 'TIVERTON', 'TOLWORTH', 'TONBRIDGE', 
+'TORQUAY', 'TOTNES', 'TOWCESTER', 'TROON', 'TROWBRIDGE', 'TRURO', 'TWICKENHAM', 'UCKFIELD', 'UMBERLEIGH', 'UNDERWOOD', 'UTTOXETER', 
+'UXBRIDGE', 'VENTNOR', 'WADEBRIDGE', 'WAKEFIELD', 'WALLINGFORD', 'WALLINGTON', 'WALSALL', 'WALTHAM', 'WALTHAMSTOW', 'WANTAGE', 
+'WARE', 'WAREHAM', 'WARLEY', 'WARMINSTER', 'WARRINGTON', 'WARWICK', 'WARWICKS', 'WASHINGTON', 'WATERLOOVILLE', 'WATFORD', 
+'WELLING', 'WELLINGBOROUGH', 'WELLS', 'WELWYN', 'WEMBLEY', 'WESTBURY', 'WESTCLIFF-ON-SEA', 'WESTERHAM', 'WESTERN-SUPER-MARE', 
+'WESTON-SUPER-MARE', 'WETHERBY', 'WEYBRIDGE', 'WEYMOUTH', 'WHEATLEY', 'WHITBY', 'WHITEHAVEN', 'WHITSTABLE', 'WIDNES', 'WIGAN', 
+'WILLENHALL', 'WILMSLOW', 'WIMBORNE', 'WINCHESTER', 'WINDSOR', 'WINSFORD', 'WIRRAL', 'WISBECH', 'WITHAM', 'WITNEY', 'WOKING', 
+'WOKINGHAM', 'WOLLASTON', 'WOLVERHAMPTON', 'WORCESTER', 'WORKINGTON', 'WORKSOP', 'WORSLEY', 'WORTHING', 'WREXHAM', 'WYMONDHAM', 
+'YATELEY', 'YEOVIL', 'YORK', 'YORKS');
+
+-- The remainder (600+) either have rarer towns or anomalous formats, like no town at all.
+-- In these cases, rather than deleting, leave them so the remainder of CleanedAddress will be placed
+-- into ADDRESS_1 with the TOWN field empty.
+
+-- Remove contents of TOWN field from the end of CleanedAddress
+-- for all records (even if UpdateFlag=0 in which case TOWN is an empty string):
+UPDATE ADS
+SET CleanedAddress = LTRIM(RTRIM(LEFT(CleanedAddress,LEN(CleanedAddress)-LEN([TOWN]))))
+FROM dbo.File1ParentAddresses AS ADS;
+-- Where TOWN is empty, it may still exist within CleanedAddress (to be copied into ADDRESS_1)
+-- or it may be missing, but the address may still be useful because of the postcode.
+
+-- Copy the cleaned historic parent addresses into LLCfile1 table
+-----------------------------------------------------------------
+-- Assume that what is left in File1ParentAddresses is clean enough to insert as historic rows in LLCfile1.
+-- The parent addresses are identified by FamilyID and will apply to both twins
+-- if selected for file 1 (i.e. if in table LLCfile1twinCurrent).
+-- What's left of CleanedAddress is inserted into address line 1,
+-- town into address line 3, county into address line 4, and postcode.
+-- The date (if any) is an estimate of the last known date when the given address was changed.
+-- For these old parent addresses, where the date is missing, we can insert '00/00/0000'
+-- as ADDRESS_END_DATE; documentation says this value applies when date is unknown
+-- but we know the address is not current (does not apply with start date).
+INSERT INTO dbo.LLCfile1
+ (STUDY_ID, ADDRESS_1, ADDRESS_3, ADDRESS_4, POSTCODE, ADDRESS_END_DATE, CREATE_DATE)
+SELECT 
+t.LLC_STUDY_ID AS STUDY_ID,
+a.CleanedAddress AS ADDRESS_1,
+a.TOWN AS ADDRESS_3,
+a.COUNTY AS ADDRESS_4,
+a.POSTCODE AS POSTCODE,
+CASE WHEN a.DateOfAddress IS NULL THEN '00/00/0000' ELSE CONVERT(VARCHAR(10), a.DateOfAddress, 103) END AS ADDRESS_END_DATE,
+CONVERT(VARCHAR(10), GETDATE(), 103) AS CREATE_DATE
+FROM dbo.Twins t
+INNER JOIN dbo.LLCfile1twinCurrent c ON (c.TwinID = t.TwinID)
+INNER JOIN dbo.File1ParentAddresses a ON (t.FamilyID = a.FamilyID);
+
+-- Table has now served its purpose so drop it.
+DROP TABLE dbo.File1ParentAddresses;
+
+----------------------------------------------------------------
+-- END OF FILE 1 INSERTIONS
+----------------------------------------------------------------
+
+----------------------------------------------------------------
+-- CLEAN FILE 1 FIELDS
+----------------------------------------------------------------
+-- Consider adding these final steps, as precautions to avoid problems
+-- for recipients of file 1 during processing.
+-- Remove commas from within address fields.
+--UPDATE ADS
+--SET [ADDRESS_1] = REPLACE([ADDRESS_1], ',', '')
+--FROM dbo.LLCfile1 AS ADS;
+--UPDATE ADS
+--SET [ADDRESS_2] = REPLACE([ADDRESS_2], ',', '')
+--FROM dbo.LLCfile1 AS ADS;
+--UPDATE ADS
+--SET [ADDRESS_3] = REPLACE([ADDRESS_3], ',', '')
+--FROM dbo.LLCfile1 AS ADS;
+--UPDATE ADS
+--SET [ADDRESS_4] = REPLACE([ADDRESS_4], ',', '')
+--FROM dbo.LLCfile1 AS ADS;
+--UPDATE ADS
+--SET [ADDRESS_5] = REPLACE([ADDRESS_5], ',', '')
+--FROM dbo.LLCfile1 AS ADS;
+-- Remove double quotes that appear around house names in a few cases
+--UPDATE ADS
+--SET [ADDRESS_1] = REPLACE([ADDRESS_1], '"', '')
+--FROM dbo.LLCfile1 AS ADS;
+-- Replace non-English characters in some overseas addresses
+
+----------------------------------------------------------------
+-- END OF FILE 1 PROCESSING
+----------------------------------------------------------------
+
+-- Export contents of table LLCfile1 into a csv file for the file 1 checker.
+-- This can be problematic.
+-- A method that seems to work is to use the linked table in Access;
+-- export the table to an xlsx Excel file;
+-- open in Excel; save as csv (not csv UTF-8);
+-- before importing into file checker, open in text editor to check for any odd
+-- characters at the start of the first line, before the STUDY_ID column heading.
+
+select * from dbo.LLCfile1
+order by STUDY_ID, ROW_STATUS;
+
+
+--select * from dbo.LLCfile1twinCurrent
+--order by STUDY_ID;
+
+-- Queries for File 1 Documentation in the file checker
+-------------------------------------------------------
+-- To establish Ns for boxes 1 to 8.
+-- Box 9 is automatically filled by the file checker (same as number of current rows)
+-- Categories must be non-overlapping, so that boxes 2 to 9 add up to box 1.
+
+-- Box 1 should always show 27890, total number of twins in TEDS,
+-- which should also equal the sum of the Ns in the categories selected below.
+
+SELECT COUNT(*) AS NumberOfTwins,
+CASE WHEN t.TwinWithdrawn = 0 AND t.TwinOrder = 1 AND n.Twin1linkageOptOut = 0 
+		AND n.Twin1LLCfairProcSent = 1 AND n.Twin1LLCfairProcRem1 = 1 
+		AND n.Twin1LLCfairProcEmail = 1 AND n.Twin1LLCfairProcEmailRem1 = 1 THEN 'Box 9: included'
+	WHEN t.TwinWithdrawn = 0 AND t.TwinOrder = 2 AND n.Twin2linkageOptOut = 0 
+		AND n.Twin2LLCfairProcSent = 1 AND n.Twin2LLCfairProcRem1 = 1 
+		AND n.Twin2LLCfairProcEmail = 1 AND n.Twin2LLCfairProcEmailRem1 = 1 THEN 'Box 9: included'
+	WHEN t.TwinOrder = 1 AND n.Twin1linkageOptOut = 1 THEN 'Box 5: opted out'
+	WHEN t.TwinOrder = 2 AND n.Twin2linkageOptOut = 1 THEN 'Box 5: opted out'
+	WHEN t.TwinWithdrawn = 1 AND t.TwinOrder = 1 AND n.Twin1linkageOptOut = 0 THEN 'Box 4: withdrawn'
+	WHEN t.TwinWithdrawn = 1 AND t.TwinOrder = 2 AND n.Twin2linkageOptOut = 0 THEN 'Box 4: withdrawn'
+	WHEN t.TwinWithdrawn = 0 AND t.TwinOrder = 1  
+		AND (n.Twin1LLCfairProcSent = 0 OR n.Twin1LLCfairProcRem1 = 0 
+		OR n.Twin1LLCfairProcEmail = 0 OR n.Twin1LLCfairProcEmailRem1 = 0) THEN 'Box 7: FP not sent'
+	WHEN t.TwinWithdrawn = 0 AND t.TwinOrder = 2  
+		AND (n.Twin2LLCfairProcSent = 0 OR n.Twin2LLCfairProcRem1 = 0 
+		OR n.Twin2LLCfairProcEmail = 0 OR n.Twin2LLCfairProcEmailRem1 = 0) THEN 'Box 7: FP not sent'
+	ELSE 'uncategorised' END AS Category
+FROM dbo.NHSlinkageProgress n
+INNER JOIN dbo.Twins t ON (n.FamilyID = t.FamilyID)
+GROUP BY 
+	CASE WHEN t.TwinWithdrawn = 0 AND t.TwinOrder = 1 AND n.Twin1linkageOptOut = 0 
+		AND n.Twin1LLCfairProcSent = 1 AND n.Twin1LLCfairProcRem1 = 1 
+		AND n.Twin1LLCfairProcEmail = 1 AND n.Twin1LLCfairProcEmailRem1 = 1 THEN 'Box 9: included'
+	WHEN t.TwinWithdrawn = 0 AND t.TwinOrder = 2 AND n.Twin2linkageOptOut = 0 
+		AND n.Twin2LLCfairProcSent = 1 AND n.Twin2LLCfairProcRem1 = 1 
+		AND n.Twin2LLCfairProcEmail = 1 AND n.Twin2LLCfairProcEmailRem1 = 1 THEN 'Box 9: included'
+	WHEN t.TwinOrder = 1 AND n.Twin1linkageOptOut = 1 THEN 'Box 5: opted out'
+	WHEN t.TwinOrder = 2 AND n.Twin2linkageOptOut = 1 THEN 'Box 5: opted out'
+	WHEN t.TwinWithdrawn = 1 AND t.TwinOrder = 1 AND n.Twin1linkageOptOut = 0 THEN 'Box 4: withdrawn'
+	WHEN t.TwinWithdrawn = 1 AND t.TwinOrder = 2 AND n.Twin2linkageOptOut = 0 THEN 'Box 4: withdrawn'
+	WHEN t.TwinWithdrawn = 0 AND t.TwinOrder = 1  
+		AND (n.Twin1LLCfairProcSent = 0 OR n.Twin1LLCfairProcRem1 = 0 
+		OR n.Twin1LLCfairProcEmail = 0 OR n.Twin1LLCfairProcEmailRem1 = 0) THEN 'Box 7: FP not sent'
+	WHEN t.TwinWithdrawn = 0 AND t.TwinOrder = 2  
+		AND (n.Twin2LLCfairProcSent = 0 OR n.Twin2LLCfairProcRem1 = 0 
+		OR n.Twin2LLCfairProcEmail = 0 OR n.Twin2LLCfairProcEmailRem1 = 0) THEN 'Box 7: FP not sent'
+	ELSE 'uncategorised' END;
+
+-- Note: criteria in the CASE statement must match those used to select current rows above.
+
+-- Assumptions: opt outs (box 5) will include some who are also withdrawn
+-- so withdrawn (box 4) excludes these.
+-- FP not sent (box 7) excludes withdrawn because they are in boxes 4 and 5.
+-- Other categories in the form (boxes 2, 3, 6, 8) are ignored and 0 should go in these boxes.
+-- Boxes 2 and 3 are for twins who have died, but these are included in the 'withdrawn' numbers.
+-- Box 8 is exclusion for 'other' reasons, which are as yet unidentified.
+-- Box 6 is equivalent to box 5 for TEDS: opt-outs apply both to NHS Linkage and use of data in TRE
+--  and they should only be counted once, in box 5.
+
