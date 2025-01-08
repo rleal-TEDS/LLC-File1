@@ -1,0 +1,73 @@
+-- LLCfile1twinCurrent table
+----------------------------
+-- To make selection of the 'current' row for each twin to be included
+-- in the next LLC file 1 submission.
+-- When populated, will be used to help select the 'historic' rows
+-- before inserting both current and historic rows in another table
+-- as the basis for submission.
+
+-- The field names and types are specified by LLC and are all char/varchar,
+-- but in this table the TwinID and some additional numeric admin fields are added.
+-- The ultimate destination will be a csv file
+-- in which empty strings will effectively be treated as nulls
+-- so treat all columns as NOT NULL with defaults of empty strings.
+-- Note: the flag fields are all defined as CHAR with default values
+-- because these are always non-null in current rows
+-- but gender_cd may be null (for opted out twins) so is defined as VARCHAR
+-- to ensure empty strings not spaces end up in the csv file.
+
+-- Postcodes must have valid UK format with max length 8; replace with empty string if longer or if overseas address or if invalid.
+
+
+DROP TABLE TEDS_ADMIN.dbo.LLCfile1twinCurrent;
+
+CREATE TABLE TEDS_ADMIN.dbo.LLCfile1twinCurrent
+(
+TwinID int NOT NULL,
+STUDY_ID VARCHAR(50) NOT NULL,
+ROW_STATUS CHAR(1) NOT NULL DEFAULT 'C',
+NHS_NUMBER VARCHAR(10) NOT NULL DEFAULT '',
+SURNAME VARCHAR(255) NOT NULL DEFAULT '',
+FORENAME VARCHAR(255) NOT NULL DEFAULT '',
+MIDDLENAMES VARCHAR(255) NOT NULL DEFAULT '',
+ADDRESS_1 VARCHAR(255) NOT NULL DEFAULT '',
+ADDRESS_2 VARCHAR(255) NOT NULL DEFAULT '',
+ADDRESS_3 VARCHAR(255) NOT NULL DEFAULT '',
+ADDRESS_4 VARCHAR(255) NOT NULL DEFAULT '',
+ADDRESS_5 VARCHAR(255) NOT NULL DEFAULT '',
+POSTCODE VARCHAR(8) NOT NULL DEFAULT '',
+ADDRESS_START_DATE VARCHAR(10) NOT NULL DEFAULT '',
+ADDRESS_END_DATE VARCHAR(10) NOT NULL DEFAULT '',
+DATE_OF_BIRTH VARCHAR(10) NOT NULL,
+GENDER_CD VARCHAR(1) NOT NULL,
+CREATE_DATE VARCHAR(10) NOT NULL DEFAULT GETDATE(),
+UKLLC_STATUS CHAR(1) NOT NULL DEFAULT '1',
+NHS_E_Linkage_Permission CHAR(1) NOT NULL DEFAULT '1',
+NHS_Digital_Study_Number VARCHAR(50) NOT NULL DEFAULT '9',
+NHS_S_Linkage_Permission CHAR(1) NOT NULL DEFAULT '1',
+NHS_S_Study_Number VARCHAR(50) NOT NULL DEFAULT '9',
+NHS_W_Linkage_Permission CHAR(1) NOT NULL DEFAULT '1',
+NHS_NI_Linkage_Permission CHAR(1) NOT NULL DEFAULT '1',
+NHS_NI_Study_Number VARCHAR(50) NOT NULL DEFAULT '9',
+Geocoding_Permission CHAR(1) NOT NULL DEFAULT '0',
+Small_Area_Permission CHAR(1) NOT NULL DEFAULT '0',
+Environment_Permission CHAR(1) NOT NULL DEFAULT '0',
+Property_Level_Permission CHAR(1) NOT NULL DEFAULT '0',
+Multiple_Birth CHAR(1) NOT NULL DEFAULT '1',
+National_Opt_Out CHAR(1) NOT NULL DEFAULT '1',
+DFE_Linkage_Permission CHAR(1) NOT NULL DEFAULT '0',
+DWP_Linkage_Permission CHAR(1) NOT NULL DEFAULT '0',
+HMRC_Linkage_Permission CHAR(1) NOT NULL DEFAULT '0',
+LLCfile1alreadySent bit NOT NULL DEFAULT 0,
+Withdrawn bit NOT NULL DEFAULT 0,
+OptedOut bit NOT NULL DEFAULT 0,
+FairProcessingSent bit NOT NULL DEFAULT 0
+)
+
+-- Make TwinID primary key and a foreign key for integrity
+ALTER TABLE TEDS_ADMIN.dbo.LLCfile1twinCurrent ADD 
+	CONSTRAINT PK_LLCfile1twinCurrent PRIMARY KEY (TwinID),
+	CONSTRAINT FK_LLCfile1twinCurrent_TwinID FOREIGN KEY (TwinID) REFERENCES TEDS_ADMIN.dbo.Twins (TwinID)
+
+
+--select * from TEDS_ADMIN.dbo.LLCfile1twinCurrent
